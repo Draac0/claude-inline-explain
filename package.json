@@ -1,0 +1,317 @@
+{
+  "name": "claude-inline-explain",
+  "displayName": "Claude Inline Explain",
+  "description": "Select code, click Explain, and ask Claude Code about it in an inline popover. Uses your local Claude Code CLI (and its login) instead of an API key.",
+  "version": "0.1.0",
+  "publisher": "draac0",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "claude",
+    "claude code",
+    "explain",
+    "ai",
+    "cursor"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeInlineExplain.explain",
+        "title": "Explain with Claude",
+        "category": "Claude Inline Explain",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "claudeInlineExplain.submit",
+        "title": "Send",
+        "category": "Claude Inline Explain"
+      },
+      {
+        "command": "claudeInlineExplain.close",
+        "title": "Close",
+        "category": "Claude Inline Explain",
+        "icon": "$(close)"
+      },
+      {
+        "command": "claudeInlineExplain.stop",
+        "title": "Stop Generating",
+        "category": "Claude Inline Explain",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "claudeInlineExplain.copyAnswer",
+        "title": "Copy Answer",
+        "category": "Claude Inline Explain",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "claudeInlineExplain.selectModel",
+        "title": "Select Model",
+        "category": "Claude Inline Explain",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "claudeInlineExplain.openSettings",
+        "title": "Open Settings",
+        "category": "Claude Inline Explain"
+      },
+      {
+        "command": "claudeInlineExplain.showLogs",
+        "title": "Show Logs",
+        "category": "Claude Inline Explain"
+      },
+      {
+        "command": "claudeInlineExplain.explainFromEmptyInput",
+        "title": "Explain (empty prompt)",
+        "category": "Claude Inline Explain"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "claudeInlineExplain.explain",
+        "key": "ctrl+alt+e",
+        "mac": "cmd+alt+e",
+        "when": "editorTextFocus && !commentEditorFocused"
+      },
+      {
+        "command": "editor.action.submitComment",
+        "key": "enter",
+        "when": "commentEditorFocused && commentController == claudeInlineExplain && !suggestWidgetVisible && !commentIsEmpty"
+      },
+      {
+        "command": "claudeInlineExplain.explainFromEmptyInput",
+        "key": "enter",
+        "when": "commentEditorFocused && commentController == claudeInlineExplain && !suggestWidgetVisible && commentIsEmpty"
+      },
+      {
+        "command": "claudeInlineExplain.close",
+        "key": "escape",
+        "when": "commentEditorFocused && commentController == claudeInlineExplain && !suggestWidgetVisible"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "claudeInlineExplain.explain",
+          "when": "editorHasSelection",
+          "group": "navigation@100"
+        }
+      ],
+      "comments/commentThread/context": [
+        {
+          "command": "claudeInlineExplain.submit",
+          "group": "inline@1",
+          "when": "commentController == claudeInlineExplain"
+        },
+        {
+          "command": "claudeInlineExplain.close",
+          "group": "inline@2",
+          "when": "commentController == claudeInlineExplain"
+        }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "claudeInlineExplain.stop",
+          "group": "inline@1",
+          "when": "commentController == claudeInlineExplain && commentThread == claudeExplain.busy"
+        },
+        {
+          "command": "claudeInlineExplain.selectModel",
+          "group": "inline@2",
+          "when": "commentController == claudeInlineExplain"
+        },
+        {
+          "command": "claudeInlineExplain.close",
+          "group": "inline@3",
+          "when": "commentController == claudeInlineExplain"
+        }
+      ],
+      "comments/comment/title": [
+        {
+          "command": "claudeInlineExplain.copyAnswer",
+          "group": "inline@1",
+          "when": "commentController == claudeInlineExplain && comment == claudeExplain.answer"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "claudeInlineExplain.submit",
+          "when": "false"
+        },
+        {
+          "command": "claudeInlineExplain.close",
+          "when": "false"
+        },
+        {
+          "command": "claudeInlineExplain.stop",
+          "when": "false"
+        },
+        {
+          "command": "claudeInlineExplain.copyAnswer",
+          "when": "false"
+        },
+        {
+          "command": "claudeInlineExplain.explainFromEmptyInput",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Claude Inline Explain",
+      "properties": {
+        "claudeInlineExplain.model": {
+          "type": "string",
+          "default": "sonnet",
+          "enum": [
+            "sonnet",
+            "opus",
+            "haiku",
+            "fable",
+            "default"
+          ],
+          "enumDescriptions": [
+            "Latest Sonnet (fast, recommended for explanations)",
+            "Latest Opus (most capable, slower)",
+            "Latest Haiku (fastest, cheapest)",
+            "Latest Fable",
+            "Whatever model your Claude Code CLI is configured to use"
+          ],
+          "markdownDescription": "Model Claude Code uses for answers. Overridden by `#claudeInlineExplain.customModel#` when that is set."
+        },
+        "claudeInlineExplain.customModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "A full model name or alias to pass to `claude --model`, such as `claude-sonnet-5-5`. Leave empty to use `#claudeInlineExplain.model#`."
+        },
+        "claudeInlineExplain.effort": {
+          "type": "string",
+          "default": "",
+          "enum": [
+            "",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "enumDescriptions": [
+            "Claude Code default",
+            "Low",
+            "Medium",
+            "High",
+            "Extra high",
+            "Max"
+          ],
+          "description": "Reasoning effort passed to `claude --effort`. Lower is faster."
+        },
+        "claudeInlineExplain.claudePath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the `claude` executable. Leave empty to auto-detect (PATH, `~/.local/bin`, `~/.claude/local`, Homebrew, and your login shell)."
+        },
+        "claudeInlineExplain.showCodeLens": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show a clickable **✨ Explain** button above the selected code. Requires `#editor.codeLens#`."
+        },
+        "claudeInlineExplain.showInlineHint": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show a faded 'Explain ⌘⌥E' hint at the end of the selection. The hint is not clickable, but it does not shift any lines."
+        },
+        "claudeInlineExplain.showCodeAction": {
+          "type": "boolean",
+          "default": true,
+          "description": "Offer 'Explain with Claude' in the lightbulb / Quick Fix menu (⌘.) when code is selected."
+        },
+        "claudeInlineExplain.selectionDebounceMs": {
+          "type": "number",
+          "default": 350,
+          "minimum": 0,
+          "description": "How long the selection must stay still before the Explain button appears."
+        },
+        "claudeInlineExplain.popoverPosition": {
+          "type": "string",
+          "default": "above",
+          "enum": [
+            "above",
+            "below"
+          ],
+          "description": "Show the popover above or below the selected code."
+        },
+        "claudeInlineExplain.contextLines": {
+          "type": "number",
+          "default": 40,
+          "minimum": 0,
+          "description": "Number of lines before and after the selection to send as surrounding context."
+        },
+        "claudeInlineExplain.defaultQuestion": {
+          "type": "string",
+          "default": "Explain what this code does.",
+          "description": "Question used when you send an empty prompt."
+        },
+        "claudeInlineExplain.systemPrompt": {
+          "type": "string",
+          "default": "",
+          "editPresentation": "multilineText",
+          "description": "Replaces the built-in system prompt. Leave empty to use the default, which asks for concise answers."
+        },
+        "claudeInlineExplain.allowReadOnlyTools": {
+          "type": "boolean",
+          "default": false,
+          "description": "Let Claude use Read, Grep and Glob to look at other files in your workspace. Answers get better context but take longer."
+        },
+        "claudeInlineExplain.loadClaudeCustomizations": {
+          "type": "boolean",
+          "default": false,
+          "description": "Load your CLAUDE.md files, hooks, plugins and MCP servers. When off, the extension runs Claude Code with --safe-mode, which is much faster to start. Login and model selection work the same either way."
+        },
+        "claudeInlineExplain.timeoutSeconds": {
+          "type": "number",
+          "default": 180,
+          "minimum": 10,
+          "description": "Stop a request that takes longer than this many seconds."
+        },
+        "claudeInlineExplain.showStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the current model in the status bar. Click it to switch models."
+        }
+      }
+    },
+    "configurationDefaults": {
+      "comments.openView": "never"
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test:cli": "npm run compile && node ./out/test/cliSmoke.js",
+    "test": "npm run compile && node ./out/test/runTest.js",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^20.17.0",
+    "@types/vscode": "1.90.0",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^3.6.0",
+    "mocha": "^11.7.0",
+    "typescript": "^5.9.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Draac0/inline_explain_claude_ext"
+  }
+}

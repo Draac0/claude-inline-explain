@@ -11,6 +11,15 @@ export const TOOLS_ADDENDUM = `
 
 You may use the Read, Grep and Glob tools to look up definitions elsewhere in the workspace when that materially improves the answer. Keep lookups few and fast.`;
 
+export function withInstructions(systemPrompt: string, instructions: string): string {
+  const extra = instructions.trim();
+  if (!extra) return systemPrompt;
+  return `${systemPrompt}
+
+The user's own rules for every answer (follow them; they win over the defaults above if they conflict):
+${extra}`;
+}
+
 export interface CodeContext {
   relativePath: string;
   languageId: string;

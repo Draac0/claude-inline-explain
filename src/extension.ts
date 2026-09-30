@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import * as os from "os";
 import * as path from "path";
 import { runClaude, ClaudeError, resetAuthCache } from "./claude";
-import { buildPrompt, CodeContext, DEFAULT_SYSTEM_PROMPT, TOOLS_ADDENDUM, Turn } from "./prompt";
+import { buildPrompt, CodeContext, DEFAULT_SYSTEM_PROMPT, TOOLS_ADDENDUM, Turn, withInstructions } from "./prompt";
 
 const CONTROLLER_ID = "claudeInlineExplain";
 const CFG = "claudeInlineExplain";
@@ -97,7 +97,10 @@ class ExplainSession {
 
     const c = cfg();
     const tools = c.get<boolean>("allowReadOnlyTools", false);
-    const systemPrompt = (c.get<string>("systemPrompt")?.trim() || DEFAULT_SYSTEM_PROMPT) + (tools ? TOOLS_ADDENDUM : "");
+    const systemPrompt = withInstructions(
+      (c.get<string>("systemPrompt")?.trim() || DEFAULT_SYSTEM_PROMPT) + (tools ? TOOLS_ADDENDUM : ""),
+      c.get<string>("instructions") ?? ""
+    );
 
     return runClaude({
       prompt: buildPrompt(this.ctx, history, question),
@@ -181,9 +184,12 @@ class ExplainSession {
       t.comment.label = t.durationMs ? `${t.model} · ${(t.durationMs / 1000).toFixed(1)}s` : t.model;
     }
     this.thread.comments = this.turns.map((t) => t.comment);
-    this.thread.contextValue = this.busy ? "claudeExplain.busy" : "claudeExplain.idle";
+    // Only push header changes when they differ; every thread update re-renders the widget.
+    const contextValue = this.busy ? "claudeExplain.busy" : "claudeExplain.idle";
+    if (this.thread.contextValue !== contextValue) this.thread.contextValue = contextValue;
     const lines = this.ctx.startLine === this.ctx.endLine ? `line ${this.ctx.startLine}` : `lines ${this.ctx.startLine}–${this.ctx.endLine}`;
-    this.thread.label = `Claude · ${currentModel()} · ${lines}${this.busy ? " · thinking…" : ""}`;
+    const label = `Claude · ${currentModel()} · ${lines}${this.busy ? " · thinking…" : ""}`;
+    if (this.thread.label !== label) this.thread.label = label;
   }
 
   dispose(): void {
@@ -370,6 +376,7 @@ class ExplainController implements vscode.Disposable {
   closeSession(arg?: vscode.CommentThread | vscode.CommentReply, fromInput = false): void {
     const thread = arg && ("thread" in arg ? arg.thread : arg);
     const s = arg ? this.sessionFor(arg) : this.session;
+    log(`close: arg=${arg ? "yes" : "no"} fromInput=${fromInput} session=${!!s} adopted=${!!s?.thread}`);
     if (s && !s.thread && !thread) {
       // The popover is still the built-in template thread, which we have no
       // handle to. Collapsing an empty thread deletes it. "hideComment" only
@@ -587,7 +594,11 @@ export function activate(context: vscode.ExtensionContext): InlineExplainApi {
       providedCodeActionKinds: [ExplainCodeActionProvider.kind],
     }),
     vscode.commands.registerCommand("claudeInlineExplain.explain", (uri?: vscode.Uri, range?: vscode.Range) => controller.open(uri, range)),
-    vscode.commands.registerCommand("claudeInlineExplain.submit", (reply: vscode.CommentReply) => controller.submit(reply)),
+    // Don't return the answer promise: the editor clears and collapses the input
+    // only after this command resolves, which would wipe a follow-up typed meanwhile.
+    vscode.commands.registerCommand("claudeInlineExplain.submit", (reply: vscode.CommentReply) => {
+      void controller.submit(reply);
+    }),
     vscode.commands.registerCommand("claudeInlineExplain.stop", (arg?: vscode.CommentThread) => controller.stop(arg)),
     vscode.commands.registerCommand("claudeInlineExplain.close", (arg?: vscode.CommentThread | vscode.CommentReply) => controller.closeSession(arg, !arg)),
     vscode.commands.registerCommand("claudeInlineExplain.explainFromEmptyInput", () => controller.explainFromEmptyInput()),
@@ -602,6 +613,9 @@ export function activate(context: vscode.ExtensionContext): InlineExplainApi {
       vscode.commands.executeCommand("workbench.action.openSettings", `@ext:${context.extension.id}`)
     ),
     vscode.commands.registerCommand("claudeInlineExplain.showLogs", () => output.show()),
+    vscode.commands.registerCommand("claudeInlineExplain.editInstructions", () =>
+      vscode.commands.executeCommand("workbench.action.openSettings", `${CFG}.instructions`)
+    ),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (!e.affectsConfiguration(CFG)) return;
       if (e.affectsConfiguration(`${CFG}.claudePath`)) resetAuthCache();

@@ -57,6 +57,13 @@ export class Cdp {
     await this.send("Input.dispatchKeyEvent", { type: "keyUp", key, code: key, windowsVirtualKeyCode: code, nativeVirtualKeyCode: code });
   }
 
+  // modifiers: Alt=1, Ctrl=2, Meta=4, Shift=8
+  async chord(key: string, code: string, keyCode: number, modifiers: number): Promise<void> {
+    const base = { key, code, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode, modifiers };
+    await this.send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base });
+    await this.send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+  }
+
   async screenshot(dir: string, name: string): Promise<string> {
     const { data } = await this.send("Page.captureScreenshot", { format: "png" });
     fs.mkdirSync(dir, { recursive: true });

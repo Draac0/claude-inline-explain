@@ -2,7 +2,7 @@
   "name": "claude-inline-explain",
   "displayName": "Claude Inline Explain",
   "description": "Select code, click Explain, and ask Claude Code about it in an inline popover. Uses your local Claude Code CLI (and its login) instead of an API key.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "draac0",
   "license": "MIT",
   "engines": {
@@ -75,9 +75,20 @@
         "command": "claudeInlineExplain.explainFromEmptyInput",
         "title": "Explain (empty prompt)",
         "category": "Claude Inline Explain"
+      },
+      {
+        "command": "claudeInlineExplain.editInstructions",
+        "title": "Edit Answer Instructions",
+        "category": "Claude Inline Explain"
       }
     ],
     "keybindings": [
+      {
+        "command": "claudeInlineExplain.explain",
+        "key": "ctrl+alt+e",
+        "mac": "cmd+k",
+        "when": "editorTextFocus && editorHasSelection && !commentEditorFocused"
+      },
       {
         "command": "claudeInlineExplain.explain",
         "key": "ctrl+alt+e",
@@ -98,6 +109,11 @@
         "command": "claudeInlineExplain.close",
         "key": "escape",
         "when": "commentEditorFocused && commentController == claudeInlineExplain && !suggestWidgetVisible"
+      },
+      {
+        "command": "claudeInlineExplain.close",
+        "key": "escape",
+        "when": "commentFocused && !commentEditorFocused && commentController == claudeInlineExplain"
       }
     ],
     "menus": {
@@ -260,6 +276,12 @@
           "type": "string",
           "default": "Explain what this code does.",
           "description": "Question used when you send an empty prompt."
+        },
+        "claudeInlineExplain.instructions": {
+          "type": "string",
+          "default": "",
+          "editPresentation": "multilineText",
+          "markdownDescription": "Your style rules, added to **every** question. For example: `Keep it short. Use simple Indian English. Show a small example when it helps.` Unlike `#claudeInlineExplain.systemPrompt#`, this keeps the built-in prompt and adds to it."
         },
         "claudeInlineExplain.systemPrompt": {
           "type": "string",

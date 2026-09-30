@@ -1,0 +1,17 @@
+[
+  {
+    "key": "cmd+k",
+    "command": "claudeInlineExplain.explain",
+    "when": "editorTextFocus && editorHasSelection && !commentEditorFocused"
+  },
+  {
+    "key": "escape",
+    "command": "claudeInlineExplain.close",
+    "when": "commentEditorFocused && commentController == claudeInlineExplain"
+  },
+  {
+    "key": "escape",
+    "command": "claudeInlineExplain.close",
+    "when": "commentFocused && !commentEditorFocused && commentController == claudeInlineExplain"
+  }
+]

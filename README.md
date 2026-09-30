@@ -22,15 +22,31 @@ In Cursor you can also use **Extensions → … → Install from VSIX…**.
 ## Use
 
 1. Select some code. A **✨ Explain ⌘⌥E** button appears above the selection.
-2. Click it, or press **⌘⌥E** (Ctrl+Alt+E on Windows/Linux). A popover opens above the code with the cursor in the input.
+2. Press **⌘K**, or click the button (⌘⌥E also works; Ctrl+Alt+E on Windows/Linux). A popover opens above the code with the cursor already in the input.
 3. Type any question and press **Enter**. Press Enter on an empty input to get a plain explanation. Shift+Enter adds a new line.
 4. Click **Add a follow-up…** to keep asking about the same selection. Earlier answers are sent as context.
 
-The popover title bar has **Stop** (while an answer is streaming), **Select Model** (⚙) and **Close** (×, or Esc). Each answer has a **Copy** button.
+Press **Esc** to close the popover. The title bar also has **Stop** (while an answer is streaming), **Select Model** (⚙) and **Close** (×). Each answer has a **Copy** button.
+
+With a selection, ⌘K opens this popover instead of Cursor's Quick Edit. Quick Edit still works from the **Quick Edit** button on Cursor's selection bar, and ⌘K still opens it when nothing is selected.
+
+### If ⌘K or Esc don't work
+
+Keybindings in your own `keybindings.json` beat extension keybindings. If yours binds ⌘K or Escape (Cursor's defaults do), add the entries from [keybindings.cursor-overrides.json](keybindings.cursor-overrides.json) at the **end** of your `keybindings.json`. Open it with **Preferences: Open Keyboard Shortcuts (JSON)**.
 
 You can also open the popover from the editor's right-click menu (**Explain with Claude**) or from the lightbulb / Quick Fix menu (⌘.).
 
 > Cursor's own **Add to Chat / Quick Edit** bar is built into Cursor and isn't open to extensions, so the Explain button is a clickable CodeLens directly above the selection.
+
+## Answer style for every question
+
+Put your rules in `claudeInlineExplain.instructions`. They're added to every question, on top of the built-in prompt:
+
+```jsonc
+"claudeInlineExplain.instructions": "Keep the explanation short and simple. Use simple Indian English. Where it helps, show a small example."
+```
+
+Run **Claude Inline Explain: Edit Answer Instructions** to jump straight to this setting. To replace the built-in prompt entirely, use `claudeInlineExplain.systemPrompt` instead.
 
 ## Choosing the model
 
@@ -63,6 +79,7 @@ Any of these work:
 | `claudeInlineExplain.selectionDebounceMs` | `350` | How long a selection must stay still before the button appears. |
 | `claudeInlineExplain.popoverPosition` | `above` | `above` or `below` the selection. |
 | `claudeInlineExplain.contextLines` | `40` | Lines of surrounding code sent with the selection. |
+| `claudeInlineExplain.instructions` | `""` | Your style rules, added to every question. |
 | `claudeInlineExplain.defaultQuestion` | `Explain what this code does.` | Question used when you send an empty input. |
 | `claudeInlineExplain.systemPrompt` | `""` | Replaces the built-in system prompt, which asks for concise answers. |
 | `claudeInlineExplain.allowReadOnlyTools` | `false` | Let Claude use Read, Grep and Glob to look at other files. Better context, slower. |

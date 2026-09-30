@@ -28,7 +28,24 @@ async function rectOf(cdp: Cdp, selector: string, text?: string): Promise<{ x: n
   })()`);
 }
 
-const inCommentEditor = (cdp: Cdp) => cdp.eval<boolean>(`!!document.activeElement?.closest(".review-widget")`);
+// Clicks the element again until `done` holds: the popover can still be moving
+// (streaming text, a popover being replaced) when the first click lands.
+async function clickUntil(cdp: Cdp, what: string, selector: string, text: string | undefined, done: () => Promise<boolean> | boolean, timeoutMs = 15000) {
+  await waitFor(what, async () => {
+    if (await done()) return true;
+    const r = await rectOf(cdp, selector, text);
+    if (r) {
+      const hit = await cdp.eval<string>(`(() => { const e = document.elementFromPoint(${r.x}, ${r.y}); return e ? e.tagName + "." + String(e.className).slice(0, 80) + " | " + (e.textContent || "").trim().slice(0, 40) : "none"; })()`);
+      console.log(`   clickUntil(${what}) at ${Math.round(r.x)},${Math.round(r.y)} hits ${hit}`);
+      await cdp.click(r.x, r.y);
+    }
+    await sleep(400);
+    return await done();
+  }, timeoutMs);
+}
+
+// True only when the popover's text input (a small Monaco editor) has focus.
+const inCommentEditor = (cdp: Cdp) => cdp.eval<boolean>(`!!document.activeElement?.closest(".review-widget .comment-form .monaco-editor")`);
 
 describe("Claude Inline Explain (real editor + real Claude Code)", () => {
   let api: InlineExplainApi;
@@ -124,9 +141,7 @@ describe("Claude Inline Explain (real editor + real Claude Code)", () => {
     await cfg().update("model", "haiku", vscode.ConfigurationTarget.Global);
     assert.strictEqual(api.currentModel(), "haiku");
     const session = api.session!;
-    const reply = await waitFor("follow-up box", () => rectOf(cdp, ".review-widget .review-thread-reply-button"));
-    await cdp.click(reply.x, reply.y);
-    await waitFor("follow-up focused", () => inCommentEditor(cdp));
+    await clickUntil(cdp, "follow-up focused", ".review-widget .review-thread-reply-button", undefined, () => inCommentEditor(cdp));
     await cdp.typeText("Give a one-line summary.");
     const done = new Promise<any>((r) => session.done.event(r));
     await cdp.press("Enter");
@@ -155,9 +170,7 @@ describe("Claude Inline Explain (real editor + real Claude Code)", () => {
     await sleep(300);
     await cdp.screenshot(shotsDir, "6-empty-prompt-explain");
 
-    const reply = await waitFor("follow-up box", () => rectOf(cdp, ".review-widget .review-thread-reply-button"));
-    await cdp.click(reply.x, reply.y);
-    await waitFor("follow-up focused", () => inCommentEditor(cdp));
+    await clickUntil(cdp, "follow-up focused", ".review-widget .review-thread-reply-button", undefined, () => inCommentEditor(cdp));
     await cdp.press("Escape");
     await waitFor("popover closed", () => !api.session);
     await waitFor("widget removed", async () => !(await rectOf(cdp, ".review-widget")));
@@ -174,10 +187,59 @@ describe("Claude Inline Explain (real editor + real Claude Code)", () => {
     await sleep(500);
     assert.strictEqual(await widgets(), 1, "old empty popover should be gone");
     assert.strictEqual(api.session?.ctx.startLine, 12);
-    const close = await waitFor("Close button", () => rectOf(cdp, ".review-widget .monaco-button", "Close"));
-    await cdp.click(close.x, close.y);
-    await waitFor("popover closed", async () => (await widgets()) === 0 && !api.session);
+    await clickUntil(cdp, "popover closed", ".review-widget .monaco-button", "Close", async () => (await widgets()) === 0 && !api.session);
     assert.ok(!editor.selection.isEmpty || vscode.window.activeTextEditor?.selection.isEmpty === false, "selection kept");
+  });
+
+  it("⌘K with a selection opens the popover focused, and Esc closes it (with a Cursor-style user keymap)", async () => {
+    await select(8, 2, 22, 4);
+    await sleep(300);
+    await cdp.chord("k", "KeyK", 75, 4);
+    const session = await waitFor("session from ⌘K", () => api.session);
+    assert.strictEqual(session.ctx.startLine, 9);
+    await waitFor("input focused", () => inCommentEditor(cdp));
+    await cdp.screenshot(shotsDir, "7-cmd-k-popover");
+    await cdp.press("Escape");
+    await waitFor("popover closed by Esc", async () => !api.session && !(await rectOf(cdp, ".review-widget")));
+
+    // Typing a follow-up while an answer streams keeps focus and text; Esc then closes.
+    await select(11, 0, 14, 8);
+    await cdp.chord("k", "KeyK", 75, 4);
+    const s2 = await waitFor("session", () => (api.session?.ctx.startLine === 12 ? api.session : undefined));
+    await waitFor("input focused", () => inCommentEditor(cdp));
+    const done = new Promise<any>((r) => s2.done.event(r));
+    await cdp.typeText("explain each line in detail");
+    await cdp.press("Enter");
+    await waitFor("streaming", () => s2.turns[0]?.status === "streaming", 60000);
+    await clickUntil(cdp, "follow-up focused", ".review-widget .review-thread-reply-button", undefined, () => inCommentEditor(cdp));
+    await cdp.typeText("draft");
+    const turn = await done;
+    assert.strictEqual(turn.status, "done", turn.error);
+    await sleep(800);
+    const draft = await cdp.eval<string>(`document.querySelector(".review-widget .comment-form .monaco-editor .view-lines")?.textContent ?? ""`);
+    console.log(`after streaming: focused=${await inCommentEditor(cdp)} draft=${JSON.stringify(draft)}`);
+    assert.ok(await inCommentEditor(cdp), "follow-up input lost focus while the answer streamed");
+    assert.match(draft, /draft/);
+    await cdp.press("Escape");
+    await waitFor("answered popover closed by Esc", async () => !api.session && !(await rectOf(cdp, ".review-widget")));
+  });
+
+  it("applies the per-message instructions setting", async () => {
+    await cfg().update("instructions", "Always begin your answer with the exact word BANANA.", vscode.ConfigurationTarget.Global);
+    try {
+      await select(11, 0, 14, 8);
+      const session = (await api.open())!;
+      await waitFor("input focused", () => inCommentEditor(cdp));
+      const done = new Promise<any>((r) => session.done.event(r));
+      await cdp.typeText("what is saved?");
+      await cdp.press("Enter");
+      const turn = await done;
+      assert.strictEqual(turn.status, "done", turn.error);
+      assert.match(turn.answer, /^\W*BANANA/, turn.answer.slice(0, 80));
+    } finally {
+      await cfg().update("instructions", undefined, vscode.ConfigurationTarget.Global);
+      await vscode.commands.executeCommand("claudeInlineExplain.close");
+    }
   });
 
   it("the Stop button in the popover title cancels a running answer", async () => {
@@ -187,9 +249,8 @@ describe("Claude Inline Explain (real editor + real Claude Code)", () => {
     await cdp.typeText("Walk through this line by line in great detail.");
     await cdp.press("Enter");
     await waitFor("streaming", () => session.turns[0]?.status === "streaming", 60000);
-    const stop = await waitFor("stop button", () => rectOf(cdp, ".review-widget .codicon-debug-stop"));
     const done = new Promise<any>((r) => session.done.event(r));
-    await cdp.click(stop.x, stop.y);
+    await clickUntil(cdp, "stopped", ".review-widget .codicon-debug-stop", undefined, () => session.turns[0].status !== "streaming");
     const turn = await done;
     assert.strictEqual(turn.status, "stopped");
     await vscode.commands.executeCommand("claudeInlineExplain.close");

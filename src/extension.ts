@@ -211,7 +211,7 @@ class ExplainController implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   // The one line where a commenting range is offered (the popover's anchor), so
   // the built-in "Add Comment" can open a thread whose input is already focused.
-  private armed?: { uri: string; line: number };
+  private armed?: { uri: string; line: number; servedAt?: number };
   private rangesServed?: (uri: string) => void;
 
   constructor(context: vscode.ExtensionContext) {
@@ -230,7 +230,17 @@ class ExplainController implements vscode.Disposable {
     );
   }
 
-  async open(uri?: vscode.Uri, range?: vscode.Range): Promise<ExplainSession | undefined> {
+  // Opens run one at a time: an open temporarily moves the cursor to check the
+  // commenting range, and an overlapping open would save that as the selection.
+  private opening: Promise<unknown> = Promise.resolve();
+
+  open(uri?: vscode.Uri, range?: vscode.Range): Promise<ExplainSession | undefined> {
+    const run = this.opening.then(() => this.openNow(uri, range));
+    this.opening = run.catch((e) => log(`open failed: ${e}`));
+    return run;
+  }
+
+  private async openNow(uri?: vscode.Uri, range?: vscode.Range): Promise<ExplainSession | undefined> {
     // While the popover input has focus there is no active text editor.
     const editor = vscode.window.activeTextEditor ?? lastEditor();
     let doc: vscode.TextDocument | undefined;
@@ -256,10 +266,7 @@ class ExplainController implements vscode.Disposable {
       }
       sel = line.range;
     }
-    // A selection ending at column 0 of the next line does not really include that line.
-    if (sel.end.character === 0 && sel.end.line > sel.start.line) {
-      sel = new vscode.Range(sel.start, doc.lineAt(sel.end.line - 1).range.end);
-    }
+    sel = normalizeSelection(doc, sel);
 
     this.closeSession();
     if (vscode.window.activeTextEditor?.document !== doc) await vscode.window.showTextDocument(doc);
@@ -277,10 +284,7 @@ class ExplainController implements vscode.Disposable {
       after: doc.getText(new vscode.Range(sel.end, doc.lineAt(afterEndLine).range.end)),
     };
 
-    // Comment widgets render below their range's last line, so anchor on the
-    // line above the selection to show the popover on top of it.
-    const above = cfg().get<string>("popoverPosition", "above") === "above" && sel.start.line > 0;
-    const anchorLine = above ? sel.start.line - 1 : sel.end.line;
+    const anchorLine = anchorLineFor(sel);
     const anchor = new vscode.Range(anchorLine, 0, anchorLine, 0);
 
     const session = new ExplainSession(doc.uri, sel, anchor, ctx, workingDirFor(doc.uri), this.avatar);
@@ -295,7 +299,15 @@ class ExplainController implements vscode.Disposable {
     // could focus it is a proposal Cursor blocks. A thread opened through the
     // built-in "Add Comment" starts expanded and focused, so offer a commenting
     // range on the anchor line and open the thread there.
-    await this.arm(doc.uri, anchorLine);
+    // "Add Comment" fails with "The cursor must be within a commenting range" if
+    // the editor hasn't applied our range yet, so offer it and wait until it has.
+    if (testHooks.skipArmWait) this.prearm(doc, sel);
+    else await this.arm(doc.uri, anchorLine);
+    if (this.session !== session) return session;
+    const ed = vscode.window.visibleTextEditors.find((e) => e.document === doc);
+    if (ed && !(await this.waitForRange(ed, anchorLine, session, 3000))) {
+      log(`commenting range on line ${anchorLine + 1} not ready after 3s; trying anyway`);
+    }
     if (this.session !== session) return session;
     await vscode.commands.executeCommand("workbench.action.addComment", {
       range: { startLineNumber: anchorLine + 1, endLineNumber: anchorLine + 1, endColumn: 1 },
@@ -303,22 +315,70 @@ class ExplainController implements vscode.Disposable {
     return session;
   }
 
+  // Asks the editor to jump to its next commenting range, which reads the same
+  // list "Add Comment" checks, then puts the user's selection back. Lands on the
+  // anchor line only once the editor has applied our range.
+  private async waitForRange(ed: vscode.TextEditor, line: number, session: ExplainSession, timeoutMs: number): Promise<boolean> {
+    const saved = ed.selections;
+    const top = ed.visibleRanges[0]?.start;
+    const end = Date.now() + timeoutMs;
+    try {
+      while (Date.now() < end && this.session === session) {
+        ed.selection = new vscode.Selection(0, 0, 0, 0);
+        await vscode.commands.executeCommand("editor.action.nextCommentingRange");
+        if (ed.selection.active.line === line) return true;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      return false;
+    } finally {
+      ed.selections = saved;
+      // The jump can scroll; put the view back where it was.
+      if (top) ed.revealRange(new vscode.Range(top, top), vscode.TextEditorRevealType.AtTop);
+    }
+  }
+
+  // Called when a selection settles, so the range is usually ready by the time
+  // the user presses ⌘K.
+  prearm(doc: vscode.TextDocument, sel: vscode.Range): void {
+    const line = anchorLineFor(normalizeSelection(doc, sel));
+    const a = this.armed;
+    if (a && a.uri === doc.uri.toString() && a.line === line) return;
+    this.armed = { uri: doc.uri.toString(), line };
+    this.setRangeProvider();
+  }
+
+  // Drop a pre-armed range when the selection goes away and no popover is open.
+  unprearm(): void {
+    if (!this.session) this.disarm();
+  }
+
   private setRangeProvider(): void {
     // Reassigning the provider makes the editor ask for ranges again.
     this.comments.commentingRangeProvider = {
       provideCommentingRanges: (doc) => {
         const a = this.armed;
-        const ranges = a && a.uri === doc.uri.toString() ? [new vscode.Range(a.line, 0, a.line, 0)] : [];
-        if (ranges.length) queueMicrotask(() => this.rangesServed?.(doc.uri.toString()));
-        return ranges;
+        if (!a || a.uri !== doc.uri.toString()) return [];
+        queueMicrotask(() => {
+          a.servedAt = Date.now();
+          this.rangesServed?.(doc.uri.toString());
+        });
+        return [new vscode.Range(a.line, 0, a.line, 0)];
       },
     };
   }
 
-  private async arm(uri: vscode.Uri, line: number): Promise<void> {
-    this.armed = { uri: uri.toString(), line };
+  private async arm(uri: vscode.Uri, line: number, refresh = false): Promise<void> {
+    const key = uri.toString();
+    const settle = refresh ? 400 : 0;
+    const a = this.armed;
+    if (!refresh && a && a.uri === key && a.line === line && a.servedAt !== undefined) {
+      const age = Date.now() - a.servedAt;
+      if (age < settle) await new Promise((r) => setTimeout(r, settle - age));
+      return;
+    }
+    this.armed = { uri: key, line };
     const served = new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, 1500);
+      const timer = setTimeout(resolve, 2500);
       this.rangesServed = (u) => {
         if (u !== uri.toString()) return;
         clearTimeout(timer);
@@ -328,7 +388,7 @@ class ExplainController implements vscode.Disposable {
     });
     this.setRangeProvider();
     await served;
-    await new Promise((r) => setTimeout(r, 60)); // let the editor apply the ranges
+    await new Promise((r) => setTimeout(r, settle));
   }
 
   private disarm(): void {
@@ -420,6 +480,24 @@ class ExplainController implements vscode.Disposable {
   }
 }
 
+// A selection ending at column 0 of the next line does not really include that line.
+function normalizeSelection(doc: vscode.TextDocument, sel: vscode.Range): vscode.Range {
+  if (sel.end.character === 0 && sel.end.line > sel.start.line) {
+    return new vscode.Range(sel.start, doc.lineAt(sel.end.line - 1).range.end);
+  }
+  return sel;
+}
+
+// Comment widgets render below their range's last line, so anchor on the line
+// above the selection to show the popover on top of it.
+function anchorLineFor(sel: vscode.Range): number {
+  const above = cfg().get<string>("popoverPosition", "above") === "above" && sel.start.line > 0;
+  return above ? sel.start.line - 1 : sel.end.line;
+}
+
+// Switches used only by the integration tests.
+export const testHooks = { skipArmWait: false };
+
 let lastActiveEditor: vscode.TextEditor | undefined;
 function lastEditor(): vscode.TextEditor | undefined {
   return lastActiveEditor && vscode.window.visibleTextEditors.includes(lastActiveEditor) ? lastActiveEditor : undefined;
@@ -488,6 +566,8 @@ function trackSelection(context: vscode.ExtensionContext): void {
     const changed = next?.uri !== stableSelection?.uri || !(next && stableSelection && next.range.isEqual(stableSelection.range));
     stableSelection = next;
     if (changed) lensEvents.fire();
+    if (editor && next) controller.prearm(editor.document, next.range);
+    else if (changed) controller.unprearm();
 
     for (const e of vscode.window.visibleTextEditors) {
       if (e !== editor || !next || !cfg().get<boolean>("showInlineHint", false)) {
@@ -566,6 +646,7 @@ function settingTarget(key: string): vscode.ConfigurationTarget {
 
 export interface InlineExplainApi {
   readonly session: ExplainSession | undefined;
+  readonly testHooks: typeof testHooks;
   open(uri?: vscode.Uri, range?: vscode.Range): Promise<ExplainSession | undefined>;
   currentModel(): string;
 }
@@ -631,6 +712,7 @@ export function activate(context: vscode.ExtensionContext): InlineExplainApi {
     get session() {
       return controller.session;
     },
+    testHooks,
     open: (uri, range) => controller.open(uri, range),
     currentModel,
   };

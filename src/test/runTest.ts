@@ -38,7 +38,7 @@ async function main() {
     vscodeExecutablePath: exe,
     extensionDevelopmentPath: root,
     extensionTestsPath: path.join(__dirname, "suite", "index"),
-    extensionTestsEnv: { CIE_DEBUG: "1", CIE_KEYLOG: process.env.CIE_KEYLOG ?? "", CDP_PORT: port, SCREENSHOT_DIR: process.env.SCREENSHOT_DIR },
+    extensionTestsEnv: { MOCHA_GREP: process.env.MOCHA_GREP ?? "", CIE_DEBUG: "1", CIE_KEYLOG: process.env.CIE_KEYLOG ?? "", CDP_PORT: port, SCREENSHOT_DIR: process.env.SCREENSHOT_DIR },
     launchArgs: [
       path.join(root, "test-fixtures"),
       "--disable-extensions",

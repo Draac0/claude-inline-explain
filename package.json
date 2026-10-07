@@ -2,7 +2,7 @@
   "name": "claude-inline-explain",
   "displayName": "Claude Inline Explain",
   "description": "Select code, click Explain, and ask Claude Code about it in an inline popover. Uses your local Claude Code CLI (and its login) instead of an API key.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "draac0",
   "license": "MIT",
   "engines": {

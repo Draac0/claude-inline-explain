@@ -75,7 +75,7 @@ describe("Claude Inline Explain (real editor + real Claude Code)", () => {
     if (this.currentTest?.state === "failed") {
       const name = "FAILED-" + this.currentTest.title.replace(/[^a-z0-9]+/gi, "-").slice(0, 60);
       await cdp.screenshot(shotsDir, name).catch(() => {});
-      const dom = await cdp.eval(`(() => { const w = document.querySelector(".review-widget"); return { widget: !!w, active: document.activeElement?.className?.toString().slice(0, 80), html: w?.outerHTML.slice(0, 1500) }; })()`).catch(() => undefined);
+      const dom = await cdp.eval(`[...document.querySelectorAll(".review-widget")].map(w => { const r = w.getBoundingClientRect(); const ed = w.closest(".monaco-editor"); return { ih: innerHeight, x: Math.round(r.x), w: Math.round(r.width), op: String(w.offsetParent?.className).slice(0,40), top: Math.round(r.top), h: Math.round(r.height), vis: w.offsetParent !== null, title: w.querySelector(".review-title")?.textContent, editorTop: Math.round(ed?.getBoundingClientRect().top ?? -1), editorUri: ed?.getAttribute("data-uri") }; })`).catch(() => undefined);
       console.log("   DOM:", JSON.stringify(dom));
     }
   });
@@ -239,6 +239,56 @@ describe("Claude Inline Explain (real editor + real Claude Code)", () => {
     } finally {
       await cfg().update("instructions", undefined, vscode.ConfigurationTarget.Global);
       await vscode.commands.executeCommand("claudeInlineExplain.close");
+    }
+  });
+
+  it("⌘K right after opening a file and selecting never shows the 'commenting range' error", async () => {
+    const errorToast = () =>
+      cdp.eval<boolean>(`[...document.querySelectorAll(".notification-toast, .notifications-toasts .monaco-list-row")].some(e => /commenting range/i.test(e.textContent))`);
+    const folder = vscode.workspace.workspaceFolders![0].uri;
+    for (let round = 0; round < 6; round++) {
+      // Alternate between two files so each ⌘K lands on a freshly shown editor.
+      const file = round % 2 ? "planning.ts" : "second.ts";
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.joinPath(folder, file));
+      editor = await vscode.window.showTextDocument(doc, { preserveFocus: false });
+      const line = 1 + (round % 3);
+      editor.selection = new vscode.Selection(line, 0, line + 2, 5);
+      await sleep(150); // a fast human: still well inside the 350ms selection debounce
+      await cdp.chord("k", "KeyK", 75, 4);
+      await waitFor(`popover input focused (round ${round}, ${file})`, () => inCommentEditor(cdp), 8000);
+      assert.ok(!(await errorToast()), `'commenting range' error shown in round ${round}`);
+      assert.strictEqual(api.session?.ctx.startLine, line + 1);
+      await cdp.press("Escape");
+      await waitFor("closed", async () => !api.session && !(await rectOf(cdp, ".review-widget")));
+    }
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.joinPath(folder, "planning.ts"));
+    editor = await vscode.window.showTextDocument(doc);
+  });
+
+  it("⌘K never hits the 'commenting range' error even without waiting for the range to be served", async () => {
+    const errorToastVisible = () =>
+      cdp.eval<boolean>(`[...document.querySelectorAll(".notification-toast")].some(e => e.offsetParent !== null && /commenting range/i.test(e.textContent))`);
+    const folder = vscode.workspace.workspaceFolders![0].uri;
+    api.testHooks.skipArmWait = true; // only the readiness check stands between ⌘K and the error
+    try {
+      for (let round = 0; round < 6; round++) {
+        const file = round % 2 ? "planning.ts" : "second.ts";
+        editor = await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.joinPath(folder, file)));
+        const line = 2 + (round % 3);
+        editor.selection = new vscode.Selection(line, 0, line + 2, 5);
+        await sleep(150);
+        await cdp.chord("k", "KeyK", 75, 4);
+        await waitFor(`popover input focused (round ${round})`, () => inCommentEditor(cdp), 8000);
+        assert.ok(!(await errorToastVisible()), `error toast in round ${round}`);
+        assert.strictEqual(api.session?.selection.start.line, line);
+        const live = vscode.window.visibleTextEditors.find((e) => e.document.fileName.endsWith(file));
+        assert.strictEqual(live?.selection.start.line, line, "user's selection restored after the readiness check");
+        await cdp.press("Escape");
+        await waitFor("closed", async () => !api.session && !(await rectOf(cdp, ".review-widget")));
+      }
+    } finally {
+      api.testHooks.skipArmWait = false;
+      editor = await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.joinPath(folder, "planning.ts")));
     }
   });
 

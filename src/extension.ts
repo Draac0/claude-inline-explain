@@ -305,10 +305,28 @@ class ExplainController implements vscode.Disposable {
     else await this.arm(doc.uri, anchorLine);
     if (this.session !== session) return session;
     const ed = vscode.window.visibleTextEditors.find((e) => e.document === doc);
-    if (ed && !(await this.waitForRange(ed, anchorLine, session, 3000))) {
-      log(`commenting range on line ${anchorLine + 1} not ready after 3s; trying anyway`);
+    let ready = !ed || (await this.waitForRange(ed, anchorLine, session, 1500));
+    if (!ready && ed && this.session === session) {
+      // The window's commenting is switched off (Zen mode, "Toggle Editor
+      // Commenting", or comments.visible: false), so the editor never asks for
+      // ranges. Switch it on, as the editor's own "reveal comment" does.
+      log("commenting range not applied; turning on editor commenting and retrying");
+      await vscode.commands.executeCommand("workbench.action.toggleCommenting");
+      await this.arm(doc.uri, anchorLine, true);
+      ready = await this.waitForRange(ed, anchorLine, session, 2500);
+      if (!ready) {
+        await vscode.commands.executeCommand("workbench.action.toggleCommenting"); // leave it as we found it
+      }
     }
     if (this.session !== session) return session;
+    if (!ready) {
+      log(`commenting range on line ${anchorLine + 1} never became available; not opening the popover`);
+      this.closeSession();
+      vscode.window.showWarningMessage(
+        "Claude Inline Explain couldn't open its popover because the editor isn't accepting comments here. Try “Comments: Toggle Editor Commenting”, leave Zen mode, or check the comments.visible setting."
+      );
+      return undefined;
+    }
     await vscode.commands.executeCommand("workbench.action.addComment", {
       range: { startLineNumber: anchorLine + 1, endLineNumber: anchorLine + 1, endColumn: 1 },
     });
@@ -378,7 +396,7 @@ class ExplainController implements vscode.Disposable {
     }
     this.armed = { uri: key, line };
     const served = new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, 2500);
+      const timer = setTimeout(resolve, 1000);
       this.rangesServed = (u) => {
         if (u !== uri.toString()) return;
         clearTimeout(timer);

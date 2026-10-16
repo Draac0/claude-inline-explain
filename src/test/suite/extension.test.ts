@@ -292,6 +292,21 @@ describe("Claude Inline Explain (real editor + real Claude Code)", () => {
     }
   });
 
+  it("⌘K works even when the window's commenting is switched off (Zen mode / Toggle Editor Commenting)", async () => {
+    const errorToastVisible = () =>
+      cdp.eval<boolean>(`[...document.querySelectorAll(".notification-toast")].some(e => e.offsetParent !== null && /commenting range/i.test(e.textContent))`);
+    await vscode.commands.executeCommand("workbench.action.toggleCommenting"); // on -> off
+    await sleep(500);
+    await select(11, 0, 14, 8);
+    await sleep(150);
+    await cdp.chord("k", "KeyK", 75, 4);
+    await waitFor("popover input focused with commenting off", () => inCommentEditor(cdp), 12000);
+    assert.ok(!(await errorToastVisible()), "'commenting range' error shown");
+    await cdp.screenshot(shotsDir, "8-commenting-was-off");
+    await cdp.press("Escape");
+    await waitFor("closed", async () => !api.session && !(await rectOf(cdp, ".review-widget")));
+  });
+
   it("the Stop button in the popover title cancels a running answer", async () => {
     await select(8, 2, 22, 4);
     const session = (await api.open())!;

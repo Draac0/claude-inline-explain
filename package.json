@@ -1,8 +1,8 @@
 {
   "name": "claude-inline-explain",
   "displayName": "Claude Inline Explain",
-  "description": "Select code, click Explain, and ask Claude Code about it in an inline popover. Uses your local Claude Code CLI (and its login) instead of an API key.",
-  "version": "0.2.2",
+  "description": "Select code, press ⌘K, and ask Claude Code about it in an inline popover. Uses your local Claude Code CLI and its subscription login — never an API key.",
+  "version": "0.3.1",
   "publisher": "draac0",
   "license": "MIT",
   "engines": {
@@ -33,13 +33,8 @@
         "icon": "$(sparkle)"
       },
       {
-        "command": "claudeInlineExplain.submit",
-        "title": "Send",
-        "category": "Claude Inline Explain"
-      },
-      {
         "command": "claudeInlineExplain.close",
-        "title": "Close",
+        "title": "Close Popover",
         "category": "Claude Inline Explain",
         "icon": "$(close)"
       },
@@ -48,12 +43,6 @@
         "title": "Stop Generating",
         "category": "Claude Inline Explain",
         "icon": "$(debug-stop)"
-      },
-      {
-        "command": "claudeInlineExplain.copyAnswer",
-        "title": "Copy Answer",
-        "category": "Claude Inline Explain",
-        "icon": "$(copy)"
       },
       {
         "command": "claudeInlineExplain.selectModel",
@@ -72,13 +61,23 @@
         "category": "Claude Inline Explain"
       },
       {
-        "command": "claudeInlineExplain.explainFromEmptyInput",
-        "title": "Explain (empty prompt)",
+        "command": "claudeInlineExplain.editInstructions",
+        "title": "Edit Answer Instructions",
         "category": "Claude Inline Explain"
       },
       {
-        "command": "claudeInlineExplain.editInstructions",
-        "title": "Edit Answer Instructions",
+        "command": "claudeInlineExplain.enableInlinePopover",
+        "title": "Set Up Inline Popover (one-time)",
+        "category": "Claude Inline Explain"
+      },
+      {
+        "command": "claudeInlineExplain.addKeybindings",
+        "title": "Add ⌘K / Esc Keybindings",
+        "category": "Claude Inline Explain"
+      },
+      {
+        "command": "claudeInlineExplain.selectHeight",
+        "title": "Set Popover Height",
         "category": "Claude Inline Explain"
       }
     ],
@@ -87,33 +86,18 @@
         "command": "claudeInlineExplain.explain",
         "key": "ctrl+alt+e",
         "mac": "cmd+k",
-        "when": "editorTextFocus && editorHasSelection && !commentEditorFocused"
+        "when": "editorTextFocus && editorHasSelection"
       },
       {
         "command": "claudeInlineExplain.explain",
         "key": "ctrl+alt+e",
         "mac": "cmd+alt+e",
-        "when": "editorTextFocus && !commentEditorFocused"
-      },
-      {
-        "command": "editor.action.submitComment",
-        "key": "enter",
-        "when": "commentEditorFocused && commentController == claudeInlineExplain && !suggestWidgetVisible && !commentIsEmpty"
-      },
-      {
-        "command": "claudeInlineExplain.explainFromEmptyInput",
-        "key": "enter",
-        "when": "commentEditorFocused && commentController == claudeInlineExplain && !suggestWidgetVisible && commentIsEmpty"
+        "when": "editorTextFocus"
       },
       {
         "command": "claudeInlineExplain.close",
         "key": "escape",
-        "when": "commentEditorFocused && commentController == claudeInlineExplain && !suggestWidgetVisible"
-      },
-      {
-        "command": "claudeInlineExplain.close",
-        "key": "escape",
-        "when": "commentFocused && !commentEditorFocused && commentController == claudeInlineExplain"
+        "when": "claudeInlineExplain.popoverVisible && editorTextFocus && !editorHasSelection && !editorHasMultipleSelections && !suggestWidgetVisible && !findWidgetVisible && !inSnippetMode && !parameterHintsVisible && !renameInputVisible && !inlineSuggestionVisible"
       }
     ],
     "menus": {
@@ -124,62 +108,14 @@
           "group": "navigation@100"
         }
       ],
-      "comments/commentThread/context": [
-        {
-          "command": "claudeInlineExplain.submit",
-          "group": "inline@1",
-          "when": "commentController == claudeInlineExplain"
-        },
-        {
-          "command": "claudeInlineExplain.close",
-          "group": "inline@2",
-          "when": "commentController == claudeInlineExplain"
-        }
-      ],
-      "comments/commentThread/title": [
-        {
-          "command": "claudeInlineExplain.stop",
-          "group": "inline@1",
-          "when": "commentController == claudeInlineExplain && commentThread == claudeExplain.busy"
-        },
-        {
-          "command": "claudeInlineExplain.selectModel",
-          "group": "inline@2",
-          "when": "commentController == claudeInlineExplain"
-        },
-        {
-          "command": "claudeInlineExplain.close",
-          "group": "inline@3",
-          "when": "commentController == claudeInlineExplain"
-        }
-      ],
-      "comments/comment/title": [
-        {
-          "command": "claudeInlineExplain.copyAnswer",
-          "group": "inline@1",
-          "when": "commentController == claudeInlineExplain && comment == claudeExplain.answer"
-        }
-      ],
       "commandPalette": [
         {
-          "command": "claudeInlineExplain.submit",
-          "when": "false"
-        },
-        {
           "command": "claudeInlineExplain.close",
-          "when": "false"
+          "when": "claudeInlineExplain.popoverVisible"
         },
         {
           "command": "claudeInlineExplain.stop",
-          "when": "false"
-        },
-        {
-          "command": "claudeInlineExplain.copyAnswer",
-          "when": "false"
-        },
-        {
-          "command": "claudeInlineExplain.explainFromEmptyInput",
-          "when": "false"
+          "when": "claudeInlineExplain.popoverVisible"
         }
       ]
     },
@@ -244,7 +180,7 @@
         "claudeInlineExplain.showInlineHint": {
           "type": "boolean",
           "default": false,
-          "description": "Show a faded 'Explain ⌘⌥E' hint at the end of the selection. The hint is not clickable, but it does not shift any lines."
+          "description": "Show a faded '✨ Explain ⌘K' hint at the end of the selection. The hint is not clickable, but it does not shift any lines."
         },
         "claudeInlineExplain.showCodeAction": {
           "type": "boolean",
@@ -265,6 +201,44 @@
             "below"
           ],
           "description": "Show the popover above or below the selected code."
+        },
+        "claudeInlineExplain.fontSize": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 40,
+          "markdownDescription": "Font size of the popover text in pixels. `0` uses your editor font size (`#editor.fontSize#`)."
+        },
+        "claudeInlineExplain.fontFamily": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Font family of the popover text, for example `Inter, sans-serif`. Empty uses the system UI font. Code in answers always uses your editor font."
+        },
+        "claudeInlineExplain.popoverHeight": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "small",
+            "medium",
+            "large",
+            "xlarge"
+          ],
+          "enumDescriptions": [
+            "Fit the answer, up to Max Height",
+            "About 25% of the visible editor",
+            "About 40% of the visible editor",
+            "About 60% of the visible editor",
+            "About 80% of the visible editor"
+          ],
+          "markdownDescription": "Height of the popover while it shows answers. You can also change it from the **↕** button in the popover. A popover that only has the question box stays compact."
+        },
+        "claudeInlineExplain.maxHeight": {
+          "type": "number",
+          "default": 0.6,
+          "minimum": 0.2,
+          "maximum": 0.95,
+          "markdownDescription": "Largest height of the popover when `#claudeInlineExplain.popoverHeight#` is `auto`, as a fraction of the visible editor. Longer answers scroll inside it."
         },
         "claudeInlineExplain.contextLines": {
           "type": "number",
@@ -311,17 +285,15 @@
           "description": "Show the current model in the status bar. Click it to switch models."
         }
       }
-    },
-    "configurationDefaults": {
-      "comments.openView": "never"
     }
   },
   "scripts": {
-    "compile": "tsc -p ./",
+    "compile": "tsc -p ./ && node scripts/copy-vendor.js",
     "watch": "tsc -watch -p ./",
     "test:cli": "npm run compile && node ./out/test/cliSmoke.js",
     "test": "npm run compile && node ./out/test/runTest.js",
-    "package": "vsce package --no-dependencies"
+    "package": "vsce package --no-dependencies",
+    "vscode:prepublish": "npm run compile"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
@@ -329,11 +301,15 @@
     "@types/vscode": "1.90.0",
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.6.0",
+    "markdown-it": "^14.3.3",
     "mocha": "^11.7.0",
     "typescript": "^5.9.0"
   },
   "repository": {
     "type": "git",
     "url": "https://github.com/Draac0/inline_explain_claude_ext"
-  }
+  },
+  "enabledApiProposals": [
+    "editorInsets"
+  ]
 }

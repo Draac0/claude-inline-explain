@@ -2,16 +2,11 @@
   {
     "key": "cmd+k",
     "command": "claudeInlineExplain.explain",
-    "when": "editorTextFocus && editorHasSelection && !commentEditorFocused"
+    "when": "editorTextFocus && editorHasSelection"
   },
   {
     "key": "escape",
     "command": "claudeInlineExplain.close",
-    "when": "commentEditorFocused && commentController == claudeInlineExplain"
-  },
-  {
-    "key": "escape",
-    "command": "claudeInlineExplain.close",
-    "when": "commentFocused && !commentEditorFocused && commentController == claudeInlineExplain"
+    "when": "claudeInlineExplain.popoverVisible && editorTextFocus && !editorHasSelection && !editorHasMultipleSelections && !suggestWidgetVisible && !findWidgetVisible && !inSnippetMode && !parameterHintsVisible && !renameInputVisible && !inlineSuggestionVisible"
   }
 ]

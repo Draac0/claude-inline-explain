@@ -15,15 +15,15 @@ async function main() {
   const exe = process.env.EDITOR_EXECUTABLE || (fs.existsSync(CURSOR) ? CURSOR : undefined);
   const userData = fs.mkdtempSync("/tmp/cie-") // short: the editor puts an IPC socket in here;
   // Mirror a Cursor keymap where ⌘K and Escape are user-level bindings (which beat
-  // extension bindings), followed by the overrides the README tells users to add.
+  // extension bindings). The suite adds the extension's own entries with its
+  // "Add ⌘K / Esc Keybindings" command, as the setup does for users.
   fs.mkdirSync(path.join(userData, "User"), { recursive: true });
   fs.writeFileSync(
     path.join(userData, "User", "keybindings.json"),
     JSON.stringify(
       [
         { key: "cmd+k", command: "aipopup.action.modal.generate", when: "editorFocus && !composerBarIsVisible" },
-        { key: "escape", command: "workbench.action.hideComment", when: "commentEditorFocused" },
-        ...JSON.parse(fs.readFileSync(path.join(root, "keybindings.cursor-overrides.json"), "utf8")),
+        { key: "escape", command: "cancelSelection", when: "editorHasSelection && textInputFocus" },
       ],
       null,
       2
@@ -47,6 +47,12 @@ async function main() {
       "--skip-release-notes",
       `--user-data-dir=${userData}`,
       `--remote-debugging-port=${port}`,
+      // The popover uses the proposed "editorInsets" API (see README).
+      "--enable-proposed-api=draac0.claude-inline-explain",
+      // Keep the window "visible" when other windows cover it; otherwise
+      // Chromium won't move focus inside it.
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
     ],
   });
 }

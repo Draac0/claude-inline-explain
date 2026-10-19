@@ -1,10 +1,11 @@
-// End-to-end test inside a real editor window. Uses real clicks and key presses
-// (via CDP) and the real Claude Code CLI, and saves screenshots of each step.
+// End-to-end tests inside a real editor window: real key presses and clicks
+// (via CDP), the real inline popover (editor inset), and the real Claude Code CLI.
 import * as assert from "assert";
 import * as path from "path";
 import * as vscode from "vscode";
 import { Cdp } from "./cdp";
 import type { InlineExplainApi } from "../../extension";
+import type { ExplainSession, TurnView } from "../../popover";
 
 const shotsDir = process.env.SCREENSHOT_DIR || path.resolve(__dirname, "../../../test-screenshots");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -14,60 +15,100 @@ async function waitFor<T>(what: string, fn: () => T | undefined | Promise<T | un
   while (Date.now() < end) {
     const v = await fn();
     if (v) return v;
-    await sleep(150);
+    await sleep(100);
   }
   throw new Error(`Timed out waiting for ${what}`);
 }
 
-async function rectOf(cdp: Cdp, selector: string, text?: string): Promise<{ x: number; y: number } | undefined> {
-  return cdp.eval(`(() => {
-    const els = [...document.querySelectorAll(${JSON.stringify(selector)})]
-      .filter(e => e.offsetParent !== null && (${JSON.stringify(text ?? "")} === "" || e.textContent.includes(${JSON.stringify(text ?? "")})));
-    const r = els[0]?.getBoundingClientRect();
-    return r && r.width ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : undefined;
-  })()`);
-}
-
-// Clicks the element again until `done` holds: the popover can still be moving
-// (streaming text, a popover being replaced) when the first click lands.
-async function clickUntil(cdp: Cdp, what: string, selector: string, text: string | undefined, done: () => Promise<boolean> | boolean, timeoutMs = 15000) {
-  await waitFor(what, async () => {
-    if (await done()) return true;
-    const r = await rectOf(cdp, selector, text);
-    if (r) {
-      const hit = await cdp.eval<string>(`(() => { const e = document.elementFromPoint(${r.x}, ${r.y}); return e ? e.tagName + "." + String(e.className).slice(0, 80) + " | " + (e.textContent || "").trim().slice(0, 40) : "none"; })()`);
-      console.log(`   clickUntil(${what}) at ${Math.round(r.x)},${Math.round(r.y)} hits ${hit}`);
-      await cdp.click(r.x, r.y);
-    }
-    await sleep(400);
-    return await done();
-  }, timeoutMs);
-}
-
-// True only when the popover's text input (a small Monaco editor) has focus.
-const inCommentEditor = (cdp: Cdp) => cdp.eval<boolean>(`!!document.activeElement?.closest(".review-widget .comment-form .monaco-editor")`);
-
-describe("Claude Inline Explain (real editor + real Claude Code)", () => {
+describe("Claude Inline Explain (real editor, inline popover, real Claude Code)", () => {
   let api: InlineExplainApi;
   let cdp: Cdp;
   let editor: vscode.TextEditor;
+  let original: string;
   const cfg = () => vscode.workspace.getConfiguration("claudeInlineExplain");
+  const folder = () => vscode.workspace.workspaceFolders![0].uri;
+
+  // Editor handles get recreated as focus moves around, so always fetch a live one.
+  const show = async (file = "planning.ts") => {
+    editor = await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.joinPath(folder(), file)), { preserveFocus: false });
+    return editor;
+  };
+  // Click a line of code, as a person would, so the keyboard is in the editor
+  // (focusing an editor by API doesn't take focus away from a webview).
+  const clickCode = async () => {
+    await cdp.front();
+    const p = await cdp.eval<{ x: number; y: number } | null>(`(() => {
+      const lines = [...document.querySelectorAll(".editor-group-container .monaco-editor .margin-view-overlays .line-numbers")].filter(l => l.offsetParent && l.getBoundingClientRect().height > 0);
+      const l = lines[lines.length - 1]; if (!l) return null;
+      const r = l.getBoundingClientRect(); return { x: r.x + 4, y: r.y + r.height / 2 };
+    })()`);
+    if (p) {
+      const hit = await cdp.eval<string>(`(() => { const e = document.elementFromPoint(${p.x}, ${p.y}); return e ? e.tagName + "." + String(e.className).slice(0, 50) : "none"; })()`);
+      await cdp.click(p.x, p.y);
+      await sleep(100);
+      const active = await cdp.eval<string>(`document.activeElement ? document.activeElement.tagName + "." + String(document.activeElement.className).slice(0, 50) : "none"`);
+      if (!/inputarea/.test(active)) console.log(`   clickCode at ${Math.round(p.x)},${Math.round(p.y)} hit=${hit} -> active=${active}`);
+    }
+  };
+  const select = async (a: number, b: number, c: number, d: number, file?: string) => {
+    await show(file ?? path.basename(editor?.document.fileName ?? "planning.ts"));
+    await clickCode();
+    editor = vscode.window.activeTextEditor ?? editor;
+    editor.selection = new vscode.Selection(a, b, c, d);
+    await sleep(150); // let the "has selection" context settle, like a person would
+  };
+  const cmdK = () => cdp.chord("k", "KeyK", 75, 4);
+  const session = () => api.session;
+  const focused = (s?: ExplainSession) => !!(s ?? api.session)?.inputFocused;
+  // Other apps on the desktop can take the OS focus during long waits; the
+  // popover keeps its focus inside the window, so bring the window back first.
+  const waitFocused = async (s: ExplainSession, what = "input focused", ms = 6000) => {
+    await cdp.front();
+    return waitFor(what, () => focused(s), ms);
+  };
+  const nextDone = (s: ExplainSession) => new Promise<TurnView>((r) => s.done.event(r));
+
+  // The popover's webview is an iframe over the editor. Returns its rect in page coordinates.
+  const insetFrames = () =>
+    cdp.eval<{ x: number; y: number; w: number; h: number }[]>(`[...document.querySelectorAll("iframe.webview")]
+      .map(f => f.getBoundingClientRect()).filter(r => r.width > 50 && r.height > 20)
+      .map(r => ({ x: r.x, y: r.y, w: r.width, h: r.height }))`);
+
+  async function clickControl(s: ExplainSession, name: "close" | "stop" | "model" | "height" | "copy" | "input"): Promise<void> {
+    const rects = await s.requestRects();
+    const r = rects[name];
+    assert.ok(r, `${name} control not visible`);
+    const frames = await insetFrames();
+    assert.strictEqual(frames.length, 1, `expected one popover frame, found ${frames.length}`);
+    await cdp.click(frames[0].x + r.x, frames[0].y + r.y);
+  }
 
   before(async () => {
     const ext = vscode.extensions.getExtension<InlineExplainApi>("draac0.claude-inline-explain");
     assert.ok(ext, "extension not found");
     api = await ext.activate();
     await cfg().update("model", "sonnet", vscode.ConfigurationTarget.Global);
-    await cfg().update("showInlineHint", true, vscode.ConfigurationTarget.Global);
     cdp = await Cdp.connect(process.env.CDP_PORT || "9339");
-    // A fresh Cursor profile shows a login overlay; hide it in this throwaway test profile.
+    // A fresh Cursor profile shows a login overlay; hide it in this throwaway profile.
     await cdp.eval(`(() => { const s = document.createElement("style"); s.textContent = ".onboarding-v2-overlay{display:none!important}"; document.head.appendChild(s); })()`);
-    const folder = vscode.workspace.workspaceFolders![0].uri;
-    const doc = await vscode.workspace.openTextDocument(vscode.Uri.joinPath(folder, "planning.ts"));
-    editor = await vscode.window.showTextDocument(doc);
-    await vscode.commands.executeCommand("workbench.action.closeSidebar");
-    await vscode.commands.executeCommand("workbench.action.closePanel");
-    await vscode.commands.executeCommand("workbench.action.closeAuxiliaryBar").then(undefined, () => {});
+    // Focus trace for diagnosing failures.
+    await cdp.eval(`(() => { window.__flog = []; const d = e => e ? e.tagName + "." + String(e.className).slice(0, 40) : "null";
+      const add = (x) => { __flog.push((performance.now()|0) + " " + x); if (__flog.length > 60) __flog.shift(); };
+      document.addEventListener("focusin", e => add("in " + d(e.target)), true);
+      document.addEventListener("focusout", e => add("out " + d(e.target)), true);
+      document.addEventListener("mousedown", e => add("mousedown " + d(e.target)), true);
+      window.addEventListener("blur", () => add("WINDOW blur"));
+      window.addEventListener("focus", () => add("WINDOW focus")); })()`);
+    // What the one-time setup does for ⌘K/Esc; without it Cursor's Quick Edit owns ⌘K.
+    assert.strictEqual(await vscode.commands.executeCommand("claudeInlineExplain.addKeybindings"), true, "keybindings added");
+    assert.strictEqual(await vscode.commands.executeCommand("claudeInlineExplain.addKeybindings"), false, "second run is a no-op");
+    await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
+    await sleep(500);
+    await show();
+    original = editor.document.getText();
+    for (const c of ["workbench.action.closeSidebar", "workbench.action.closePanel", "workbench.action.closeAuxiliaryBar"]) {
+      await vscode.commands.executeCommand(c).then(undefined, () => {});
+    }
     await sleep(1500);
   });
 
@@ -75,250 +116,246 @@ describe("Claude Inline Explain (real editor + real Claude Code)", () => {
     if (this.currentTest?.state === "failed") {
       const name = "FAILED-" + this.currentTest.title.replace(/[^a-z0-9]+/gi, "-").slice(0, 60);
       await cdp.screenshot(shotsDir, name).catch(() => {});
-      const dom = await cdp.eval(`[...document.querySelectorAll(".review-widget")].map(w => { const r = w.getBoundingClientRect(); const ed = w.closest(".monaco-editor"); return { ih: innerHeight, x: Math.round(r.x), w: Math.round(r.width), op: String(w.offsetParent?.className).slice(0,40), top: Math.round(r.top), h: Math.round(r.height), vis: w.offsetParent !== null, title: w.querySelector(".review-title")?.textContent, editorTop: Math.round(ed?.getBoundingClientRect().top ?? -1), editorUri: ed?.getAttribute("data-uri") }; })`).catch(() => undefined);
-      console.log("   DOM:", JSON.stringify(dom));
+      const trace = await cdp.eval<string[]>(`window.__flog || []`).catch(() => []);
+      console.log("   focus trace (ms, page time):\n      " + trace.slice(-25).join("\n      ") + `\n      now ${await cdp.eval("performance.now()|0")}`);
+    }
+    // No test may ever change the file.
+    const doc = (await show()).document;
+    assert.strictEqual(doc.getText(), original, "the code file was modified");
+    assert.ok(!doc.isDirty, "the code file is dirty");
+    if (api.session) {
+      api.session.close("test cleanup");
+      await sleep(300);
     }
   });
 
   after(() => cdp?.close());
 
-  // Editor handles get recreated as focus moves between the editor and the popover.
-  const select = async (a: number, b: number, c: number, d: number) => {
-    editor = await vscode.window.showTextDocument(editor.document, { preserveFocus: false });
-    editor.selection = new vscode.Selection(a, b, c, d);
-  };
-
-  it("shows an Explain CodeLens, inline hint and code action when code is selected", async () => {
-    // Select the handleSave function (lines 9-23).
-    editor.selection = new vscode.Selection(8, 2, 22, 4);
-    await sleep(900);
+  it("shows an Explain CodeLens and code action when code is selected", async () => {
+    await select(8, 2, 22, 4);
+    await sleep(800);
     const lenses = await vscode.commands.executeCommand<vscode.CodeLens[]>("vscode.executeCodeLensProvider", editor.document.uri);
     const lens = lenses.find((l) => l.command?.title.includes("Explain"));
     assert.ok(lens, "Explain CodeLens missing");
     assert.strictEqual(lens.range.start.line, 8);
-
-    const actions = await vscode.commands.executeCommand<vscode.CodeAction[]>(
-      "vscode.executeCodeActionProvider", editor.document.uri, editor.selection
-    );
+    const actions = await vscode.commands.executeCommand<vscode.CodeAction[]>("vscode.executeCodeActionProvider", editor.document.uri, editor.selection);
     assert.ok(actions.some((a) => a.title.includes("Explain with Claude")), "code action missing");
-
-    await waitFor("CodeLens rendered", () => rectOf(cdp, ".codelens-decoration a", "Explain"));
-    await cdp.screenshot(shotsDir, "1-selection-explain-button");
+    await cdp.screenshot(shotsDir, "1-selection");
   });
 
-  it("clicking Explain opens a popover above the selection with the input focused", async () => {
-    const pos = await waitFor("CodeLens rendered", () => rectOf(cdp, ".codelens-decoration a", "Explain"));
-    await cdp.click(pos.x, pos.y);
-    const session = await waitFor("session", () => api.session);
-    assert.strictEqual(session.ctx.startLine, 9);
-    assert.strictEqual(session.ctx.endLine, 23);
-    assert.ok(session.ctx.selection.startsWith("const handleSave"));
-    await waitFor("popover rendered", () => rectOf(cdp, ".review-widget"));
-    await waitFor("input focused", () => inCommentEditor(cdp));
+  it("⌘K opens the inline popover above the selection with the input focused", async () => {
+    await select(8, 2, 22, 4);
+    await cmdK();
+    const s = await waitFor("popover", session);
+    assert.strictEqual(s.anchorLine, 7, "popover sits right above the selection");
+    await waitFocused(s, "input focused", 6000);
+    assert.strictEqual((await insetFrames()).length, 1);
     await cdp.screenshot(shotsDir, "2-popover-open");
   });
 
-  it("typing a question and pressing Enter streams Claude's answer into the popover", async () => {
-    const session = api.session!;
-    const question = "why is the catch block empty?";
-    await cdp.typeText(question);
-    await sleep(200);
-    const done = new Promise<any>((r) => session.done.event(r));
+  it("typed text goes into the popover; Enter streams Claude's answer, which renders as markdown", async () => {
+    await select(8, 2, 22, 4);
+    await cmdK();
+    const s = await waitFor("popover", session);
+    await waitFocused(s, "input focused", 6000);
+    const startLines = s.heightLines;
+    await cdp.typeKeys("why is the catch block empty?");
+    await waitFor("draft", () => s.draft === "why is the catch block empty?", 3000);
+    const done = nextDone(s);
     await cdp.press("Enter");
-    await waitFor("streaming started", () => session.turns[0]?.status === "streaming" || session.turns[0]?.status === "done", 60000);
+    await waitFor("streaming", () => s.turns[0]?.status === "streaming", 60000);
+    assert.ok(s.heightLines > startLines, "popover grows for the answer");
     await cdp.screenshot(shotsDir, "3-streaming");
     const turn = await done;
-    assert.strictEqual(turn.display, question, "Enter should submit the typed text (not insert a newline)");
     assert.strictEqual(turn.status, "done", turn.error);
+    assert.strictEqual(turn.display, "why is the catch block empty?");
     assert.match(turn.answer, /interceptor|toast/i);
-    assert.strictEqual(turn.model, "sonnet");
-    assert.strictEqual(session.thread?.range?.start.line, 7, "popover should anchor on the line above the selection");
-    await waitFor("answer rendered", () => cdp.eval<boolean>(`[...document.querySelectorAll(".review-widget .comment-body")].some(e => /interceptor|toast/i.test(e.textContent))`));
+    assert.strictEqual(s.draft, "", "the sent question doesn't come back into the input");
+    await waitFocused(s, "input keeps focus after answering", 5000);
+    await sleep(1800); // fit-to-content happens once typing is idle
     await cdp.screenshot(shotsDir, "4-answer");
   });
 
-  it("supports a follow-up question, using the selected model from settings", async () => {
+  it("follow-up questions keep the conversation and use the model from settings", async () => {
+    await select(8, 2, 22, 4);
+    await cmdK();
+    const s = await waitFor("popover", session);
+    await waitFocused(s, "input focused", 6000);
+    let done = nextDone(s);
+    await cdp.typeKeys("what does setQueryData do here? one sentence");
+    await cdp.press("Enter");
+    assert.strictEqual((await done).status, "done");
+
     await cfg().update("model", "haiku", vscode.ConfigurationTarget.Global);
-    assert.strictEqual(api.currentModel(), "haiku");
-    const session = api.session!;
-    await clickUntil(cdp, "follow-up focused", ".review-widget .review-thread-reply-button", undefined, () => inCommentEditor(cdp));
-    await cdp.typeText("Give a one-line summary.");
-    const done = new Promise<any>((r) => session.done.event(r));
-    await cdp.press("Enter");
-    const turn = await done;
-    assert.strictEqual(turn.status, "done", turn.error);
-    assert.strictEqual(turn.model, "haiku");
-    assert.strictEqual(session.turns.length, 2);
-    assert.ok(turn.answer.length > 10);
-    await sleep(300);
-    await cdp.screenshot(shotsDir, "5-follow-up");
+    try {
+      await waitFocused(s, "input focused", 6000);
+      done = nextDone(s);
+      await cdp.typeKeys("and invalidateQueries? one sentence");
+      await cdp.press("Enter");
+      const t2 = await done;
+      assert.strictEqual(t2.status, "done", t2.error);
+      assert.strictEqual(t2.model, "haiku");
+      assert.strictEqual(s.turns.length, 2);
+      await sleep(1800);
+      await cdp.screenshot(shotsDir, "5-follow-up");
+    } finally {
+      await cfg().update("model", "sonnet", vscode.ConfigurationTarget.Global);
+    }
   });
 
-  it("an empty prompt explains the code; Escape closes the popover", async () => {
-    await cfg().update("model", "sonnet", vscode.ConfigurationTarget.Global);
+  it("Enter on an empty input explains the code", async () => {
     await select(11, 0, 14, 8);
-    await vscode.commands.executeCommand("claudeInlineExplain.explain");
-    const session = await waitFor("new session", () => (api.session && api.session.ctx.startLine === 12 ? api.session : undefined));
-    await waitFor("input focused", () => inCommentEditor(cdp));
-    const done = new Promise<any>((r) => session.done.event(r));
+    await cmdK();
+    const s = await waitFor("popover", session);
+    await waitFocused(s, "input focused", 6000);
+    const done = nextDone(s);
     await cdp.press("Enter");
-    const turn = await done;
-    assert.strictEqual(turn.display, "explain");
-    assert.strictEqual(turn.question, "Explain what this code does.");
-    assert.strictEqual(turn.status, "done", turn.error);
-    assert.match(turn.answer, /setQueryData|cache/i);
-    await sleep(300);
-    await cdp.screenshot(shotsDir, "6-empty-prompt-explain");
-
-    await clickUntil(cdp, "follow-up focused", ".review-widget .review-thread-reply-button", undefined, () => inCommentEditor(cdp));
-    await cdp.press("Escape");
-    await waitFor("popover closed", () => !api.session);
-    await waitFor("widget removed", async () => !(await rectOf(cdp, ".review-widget")));
+    const t = await done;
+    assert.strictEqual(t.display, "explain");
+    assert.strictEqual(t.question, "Explain what this code does.");
+    assert.strictEqual(t.status, "done", t.error);
+    assert.match(t.answer, /setQueryData|cache/i);
   });
 
-  it("re-opening replaces an unused popover, and its Close button removes it", async () => {
-    const widgets = () => cdp.eval<number>(`[...document.querySelectorAll(".review-widget")].filter(e => e.offsetParent !== null).length`);
+  it("Esc in the popover closes it and returns to the code with the selection intact", async () => {
+    await select(11, 0, 14, 8);
+    await cmdK();
+    const s = await waitFor("popover", session);
+    await waitFocused(s, "input focused", 6000);
+    await cdp.press("Escape");
+    await waitFor("closed", async () => !api.session && (await insetFrames()).length === 0);
+    const live = await waitFor("editor focused", () => vscode.window.activeTextEditor);
+    assert.strictEqual(live.selection.start.line, 11);
+  });
+
+  it("Esc from the code editor also closes the popover", async () => {
+    await select(11, 0, 14, 8);
+    await cmdK();
+    const s = await waitFor("popover", session);
+    await waitFocused(s, "input focused", 6000);
+    const ed = await show();
+    ed.selection = new vscode.Selection(16, 0, 16, 0);
+    await sleep(300);
+    await cdp.press("Escape");
+    await waitFor("closed", async () => !api.session && (await insetFrames()).length === 0);
+  });
+
+  it("typing right after ⌘K lands in the popover, never in the code", async () => {
+    await select(11, 0, 14, 8);
+    await cmdK();
+    await sleep(60); // faster than any person types the next key
+    await cdp.typeKeys("abc");
+    const s = await waitFor("popover", session);
+    await waitFor("early keys in the draft", () => s.draft === "abc", 6000);
+    await waitFocused(s, "input focused", 6000);
+  });
+
+  it("⌘K right after switching files opens a focused popover every time", async () => {
+    for (let round = 0; round < 4; round++) {
+      const file = round % 2 ? "planning.ts" : "second.ts";
+      const line = 1 + (round % 3);
+      await select(line, 0, line + 2, 5, file);
+      await cmdK();
+      const s = await waitFor(`popover (round ${round})`, () => (api.session?.ctx.relativePath.endsWith(file) ? api.session : undefined));
+      await waitFocused(s, `input focused (round ${round})`, 6000);
+      assert.strictEqual((await insetFrames()).length, 1);
+      await cdp.press("Escape");
+      await waitFor("closed", () => !api.session);
+    }
+  });
+
+  it("a selection on the first line opens the popover above line 1", async () => {
+    await select(0, 0, 0, 20);
+    await cmdK();
+    const s = await waitFor("popover", session);
+    assert.strictEqual(s.anchorLine, -1);
+    await waitFocused(s, "input focused", 6000);
+    await cdp.screenshot(shotsDir, "6-first-line");
+  });
+
+  it("⌘K on another selection replaces the popover; on the same selection it refocuses", async () => {
     await select(8, 2, 22, 4);
-    await api.open();
-    await waitFor("popover", async () => (await widgets()) === 1);
+    await cmdK();
+    const s1 = await waitFor("popover", session);
+    await waitFocused(s1, "input focused", 6000);
     await select(11, 0, 14, 8);
-    await api.open();
-    await waitFor("input focused", () => inCommentEditor(cdp));
-    await sleep(500);
-    assert.strictEqual(await widgets(), 1, "old empty popover should be gone");
-    assert.strictEqual(api.session?.ctx.startLine, 12);
-    await clickUntil(cdp, "popover closed", ".review-widget .monaco-button", "Close", async () => (await widgets()) === 0 && !api.session);
-    assert.ok(!editor.selection.isEmpty || vscode.window.activeTextEditor?.selection.isEmpty === false, "selection kept");
+    await cmdK();
+    const s2 = await waitFor("second popover", () => (api.session !== s1 ? api.session : undefined));
+    assert.ok(!s1.isOpen);
+    await waitFocused(s2, "input focused", 6000);
+    assert.strictEqual((await insetFrames()).length, 1);
+
+    // Put focus back in the code, then ⌘K on the same selection.
+    await select(11, 0, 14, 8);
+    await waitFor("blurred", () => !focused(s2), 3000);
+    await cmdK();
+    await waitFocused(s2, "refocused", 6000);
+    assert.strictEqual(api.session, s2);
   });
 
-  it("⌘K with a selection opens the popover focused, and Esc closes it (with a Cursor-style user keymap)", async () => {
+  it("the Stop button stops a running answer; × closes the popover", async () => {
     await select(8, 2, 22, 4);
-    await sleep(300);
-    await cdp.chord("k", "KeyK", 75, 4);
-    const session = await waitFor("session from ⌘K", () => api.session);
-    assert.strictEqual(session.ctx.startLine, 9);
-    await waitFor("input focused", () => inCommentEditor(cdp));
-    await cdp.screenshot(shotsDir, "7-cmd-k-popover");
-    await cdp.press("Escape");
-    await waitFor("popover closed by Esc", async () => !api.session && !(await rectOf(cdp, ".review-widget")));
-
-    // Typing a follow-up while an answer streams keeps focus and text; Esc then closes.
-    await select(11, 0, 14, 8);
-    await cdp.chord("k", "KeyK", 75, 4);
-    const s2 = await waitFor("session", () => (api.session?.ctx.startLine === 12 ? api.session : undefined));
-    await waitFor("input focused", () => inCommentEditor(cdp));
-    const done = new Promise<any>((r) => s2.done.event(r));
-    await cdp.typeText("explain each line in detail");
+    await cmdK();
+    const s = await waitFor("popover", session);
+    await waitFocused(s, "input focused", 6000);
+    const done = nextDone(s);
+    await cdp.typeKeys("walk through every line in great detail");
     await cdp.press("Enter");
-    await waitFor("streaming", () => s2.turns[0]?.status === "streaming", 60000);
-    await clickUntil(cdp, "follow-up focused", ".review-widget .review-thread-reply-button", undefined, () => inCommentEditor(cdp));
-    await cdp.typeText("draft");
-    const turn = await done;
-    assert.strictEqual(turn.status, "done", turn.error);
-    await sleep(800);
-    const draft = await cdp.eval<string>(`document.querySelector(".review-widget .comment-form .monaco-editor .view-lines")?.textContent ?? ""`);
-    console.log(`after streaming: focused=${await inCommentEditor(cdp)} draft=${JSON.stringify(draft)}`);
-    assert.ok(await inCommentEditor(cdp), "follow-up input lost focus while the answer streamed");
-    assert.match(draft, /draft/);
-    await cdp.press("Escape");
-    await waitFor("answered popover closed by Esc", async () => !api.session && !(await rectOf(cdp, ".review-widget")));
+    await waitFor("streaming", () => s.turns[0]?.status === "streaming", 60000);
+    await sleep(500); // let the rebuilt (taller) popover settle
+    await clickControl(s, "stop");
+    assert.strictEqual((await done).status, "stopped");
+    await clickControl(s, "close");
+    await waitFor("closed", async () => !api.session && (await insetFrames()).length === 0);
+  });
+
+  it("the ↕ button changes the popover height, saved in settings", async () => {
+    await cfg().update("popoverHeight", "auto", vscode.ConfigurationTarget.Global);
+    try {
+      await select(11, 0, 14, 8);
+      await cmdK();
+      const s = await waitFor("popover", session);
+      await waitFocused(s);
+      const done = nextDone(s);
+      await cdp.typeKeys("one sentence please");
+      await cdp.press("Enter");
+      assert.strictEqual((await done).status, "done");
+      await sleep(1800); // auto: shrinks to fit the short answer
+      const autoLines = s.heightLines;
+
+      await clickControl(s, "height");
+      await waitFor("height picker", () => cdp.eval<boolean>(`!!document.querySelector(".quick-input-widget") && getComputedStyle(document.querySelector(".quick-input-widget")).display !== "none"`), 5000);
+      await cdp.typeKeys("Extra large");
+      await cdp.press("Enter");
+      await waitFor("setting saved", () => cfg().get("popoverHeight") === "xlarge", 5000);
+      await waitFor("popover grew", () => s.heightLines > autoLines, 5000);
+      await waitFocused(s, "input focused after picking a height");
+      const big = s.heightLines;
+      await cdp.screenshot(shotsDir, "7-height-xlarge");
+
+      await cfg().update("popoverHeight", "small", vscode.ConfigurationTarget.Global);
+      await waitFor("popover shrank from settings", () => s.heightLines < big, 5000);
+      assert.strictEqual(s.turns.length, 1, "conversation kept across resizes");
+    } finally {
+      await cfg().update("popoverHeight", undefined, vscode.ConfigurationTarget.Global);
+    }
   });
 
   it("applies the per-message instructions setting", async () => {
     await cfg().update("instructions", "Always begin your answer with the exact word BANANA.", vscode.ConfigurationTarget.Global);
     try {
       await select(11, 0, 14, 8);
-      const session = (await api.open())!;
-      await waitFor("input focused", () => inCommentEditor(cdp));
-      const done = new Promise<any>((r) => session.done.event(r));
-      await cdp.typeText("what is saved?");
+      await cmdK();
+      const s = await waitFor("popover", session);
+      await waitFocused(s, "input focused", 6000);
+      const done = nextDone(s);
+      await cdp.typeKeys("what is saved?");
       await cdp.press("Enter");
-      const turn = await done;
-      assert.strictEqual(turn.status, "done", turn.error);
-      assert.match(turn.answer, /^\W*BANANA/, turn.answer.slice(0, 80));
+      const t = await done;
+      assert.strictEqual(t.status, "done", t.error);
+      assert.match(t.answer, /^\W*BANANA/, t.answer.slice(0, 80));
     } finally {
       await cfg().update("instructions", undefined, vscode.ConfigurationTarget.Global);
-      await vscode.commands.executeCommand("claudeInlineExplain.close");
     }
-  });
-
-  it("⌘K right after opening a file and selecting never shows the 'commenting range' error", async () => {
-    const errorToast = () =>
-      cdp.eval<boolean>(`[...document.querySelectorAll(".notification-toast, .notifications-toasts .monaco-list-row")].some(e => /commenting range/i.test(e.textContent))`);
-    const folder = vscode.workspace.workspaceFolders![0].uri;
-    for (let round = 0; round < 6; round++) {
-      // Alternate between two files so each ⌘K lands on a freshly shown editor.
-      const file = round % 2 ? "planning.ts" : "second.ts";
-      const doc = await vscode.workspace.openTextDocument(vscode.Uri.joinPath(folder, file));
-      editor = await vscode.window.showTextDocument(doc, { preserveFocus: false });
-      const line = 1 + (round % 3);
-      editor.selection = new vscode.Selection(line, 0, line + 2, 5);
-      await sleep(150); // a fast human: still well inside the 350ms selection debounce
-      await cdp.chord("k", "KeyK", 75, 4);
-      await waitFor(`popover input focused (round ${round}, ${file})`, () => inCommentEditor(cdp), 8000);
-      assert.ok(!(await errorToast()), `'commenting range' error shown in round ${round}`);
-      assert.strictEqual(api.session?.ctx.startLine, line + 1);
-      await cdp.press("Escape");
-      await waitFor("closed", async () => !api.session && !(await rectOf(cdp, ".review-widget")));
-    }
-    const doc = await vscode.workspace.openTextDocument(vscode.Uri.joinPath(folder, "planning.ts"));
-    editor = await vscode.window.showTextDocument(doc);
-  });
-
-  it("⌘K never hits the 'commenting range' error even without waiting for the range to be served", async () => {
-    const errorToastVisible = () =>
-      cdp.eval<boolean>(`[...document.querySelectorAll(".notification-toast")].some(e => e.offsetParent !== null && /commenting range/i.test(e.textContent))`);
-    const folder = vscode.workspace.workspaceFolders![0].uri;
-    api.testHooks.skipArmWait = true; // only the readiness check stands between ⌘K and the error
-    try {
-      for (let round = 0; round < 6; round++) {
-        const file = round % 2 ? "planning.ts" : "second.ts";
-        editor = await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.joinPath(folder, file)));
-        const line = 2 + (round % 3);
-        editor.selection = new vscode.Selection(line, 0, line + 2, 5);
-        await sleep(150);
-        await cdp.chord("k", "KeyK", 75, 4);
-        await waitFor(`popover input focused (round ${round})`, () => inCommentEditor(cdp), 8000);
-        assert.ok(!(await errorToastVisible()), `error toast in round ${round}`);
-        assert.strictEqual(api.session?.selection.start.line, line);
-        const live = vscode.window.visibleTextEditors.find((e) => e.document.fileName.endsWith(file));
-        assert.strictEqual(live?.selection.start.line, line, "user's selection restored after the readiness check");
-        await cdp.press("Escape");
-        await waitFor("closed", async () => !api.session && !(await rectOf(cdp, ".review-widget")));
-      }
-    } finally {
-      api.testHooks.skipArmWait = false;
-      editor = await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.joinPath(folder, "planning.ts")));
-    }
-  });
-
-  it("⌘K works even when the window's commenting is switched off (Zen mode / Toggle Editor Commenting)", async () => {
-    const errorToastVisible = () =>
-      cdp.eval<boolean>(`[...document.querySelectorAll(".notification-toast")].some(e => e.offsetParent !== null && /commenting range/i.test(e.textContent))`);
-    await vscode.commands.executeCommand("workbench.action.toggleCommenting"); // on -> off
-    await sleep(500);
-    await select(11, 0, 14, 8);
-    await sleep(150);
-    await cdp.chord("k", "KeyK", 75, 4);
-    await waitFor("popover input focused with commenting off", () => inCommentEditor(cdp), 12000);
-    assert.ok(!(await errorToastVisible()), "'commenting range' error shown");
-    await cdp.screenshot(shotsDir, "8-commenting-was-off");
-    await cdp.press("Escape");
-    await waitFor("closed", async () => !api.session && !(await rectOf(cdp, ".review-widget")));
-  });
-
-  it("the Stop button in the popover title cancels a running answer", async () => {
-    await select(8, 2, 22, 4);
-    const session = (await api.open())!;
-    await waitFor("input focused", () => inCommentEditor(cdp));
-    await cdp.typeText("Walk through this line by line in great detail.");
-    await cdp.press("Enter");
-    await waitFor("streaming", () => session.turns[0]?.status === "streaming", 60000);
-    const done = new Promise<any>((r) => session.done.event(r));
-    await clickUntil(cdp, "stopped", ".review-widget .codicon-debug-stop", undefined, () => session.turns[0].status !== "streaming");
-    const turn = await done;
-    assert.strictEqual(turn.status, "stopped");
-    await vscode.commands.executeCommand("claudeInlineExplain.close");
-    assert.ok(!api.session);
   });
 });

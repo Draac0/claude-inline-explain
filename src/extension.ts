@@ -1,12 +1,14 @@
 import * as vscode from "vscode";
 import * as os from "os";
 import * as path from "path";
-import { runClaude, ClaudeError, resetAuthCache } from "./claude";
-import { buildPrompt, CodeContext, DEFAULT_SYSTEM_PROMPT, TOOLS_ADDENDUM, Turn, withInstructions } from "./prompt";
+import { resetAuthCache } from "./claude";
+import { CodeContext, DEFAULT_SYSTEM_PROMPT, TOOLS_ADDENDUM, withInstructions } from "./prompt";
+import { ExplainSession, InsetUnavailableError, PopoverHost } from "./popover";
+import * as argv from "./argv";
 
-const CONTROLLER_ID = "claudeInlineExplain";
 const CFG = "claudeInlineExplain";
-const KEY_LABEL = process.platform === "darwin" ? "⌘⌥E" : "Ctrl+Alt+E";
+const KEY_LABEL = process.platform === "darwin" ? "⌘K" : "Ctrl+Alt+E";
+const README_TROUBLESHOOTING = "https://github.com/Draac0/claude-inline-explain#if-the-popover-stops-working-after-a-cursor-or-vs-code-update";
 
 let output: vscode.OutputChannel;
 const log = (line: string) => {
@@ -25,242 +27,92 @@ export function currentModel(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Inline popover: one comment thread per explain session.
 
-type TurnStatus = "pending" | "streaming" | "done" | "error" | "stopped";
+class ExplainController implements vscode.Disposable, PopoverHost {
+  session?: ExplainSession;
+  readonly extensionUri: vscode.Uri;
+  private typeGuard?: vscode.Disposable;
+  private typeGuardTimer?: NodeJS.Timeout;
+  private typeGuardLimit?: NodeJS.Timeout;
 
-class AnswerComment implements vscode.Comment {
-  body: vscode.MarkdownString = new vscode.MarkdownString("");
-  mode = vscode.CommentMode.Preview;
-  contextValue = "claudeExplain.answer";
-  label?: string;
-  constructor(public author: vscode.CommentAuthorInformation, readonly turn: TurnView) {}
-}
-
-interface TurnView {
-  question: string;
-  display: string;
-  answer: string;
-  status: TurnStatus;
-  error?: string;
-  model: string;
-  durationMs?: number;
-  comment: AnswerComment;
-}
-
-function escapeMarkdown(text: string): string {
-  return text.replace(/[\\`*_{}\[\]()#+\-.!|<>~]/g, "\\$&");
-}
-
-class ExplainSession {
-  readonly turns: TurnView[] = [];
-  private abort?: AbortController;
-  private renderTimer?: NodeJS.Timeout;
-  private disposed = false;
-  readonly done = new vscode.EventEmitter<TurnView>();
-
-  thread?: vscode.CommentThread;
-
-  constructor(
-    readonly uri: vscode.Uri,
-    readonly selection: vscode.Range,
-    readonly anchor: vscode.Range,
-    readonly ctx: CodeContext,
-    readonly cwd: string,
-    private readonly avatar: vscode.Uri
-  ) {}
-
-  attach(thread: vscode.CommentThread): void {
-    if (this.thread === thread) return;
-    this.thread?.dispose();
-    this.thread = thread;
-    thread.canReply = true;
-    thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
-    this.render();
+  constructor(private readonly context: vscode.ExtensionContext) {
+    this.extensionUri = context.extensionUri;
   }
 
-  get busy(): boolean {
-    return !!this.abort;
-  }
+  // PopoverHost ------------------------------------------------------------
+  log = log;
+  currentModel = currentModel;
+  selectModel = selectModel;
 
-  ask(question: string, display: string): Promise<void> {
-    this.stop();
-    const model = currentModel();
-    const turn: TurnView = { question, display, answer: "", status: "pending", model } as TurnView;
-    turn.comment = new AnswerComment({ name: "Claude", iconPath: this.avatar }, turn);
-    const history: Turn[] = this.turns.filter((t) => t.status === "done").map((t) => ({ question: t.question, answer: t.answer }));
-    this.turns.push(turn);
-
-    const abort = new AbortController();
-    this.abort = abort;
-    this.render();
-
+  systemPrompt(): string {
     const c = cfg();
     const tools = c.get<boolean>("allowReadOnlyTools", false);
-    const systemPrompt = withInstructions(
-      (c.get<string>("systemPrompt")?.trim() || DEFAULT_SYSTEM_PROMPT) + (tools ? TOOLS_ADDENDUM : ""),
-      c.get<string>("instructions") ?? ""
-    );
+    return withInstructions((c.get<string>("systemPrompt")?.trim() || DEFAULT_SYSTEM_PROMPT) + (tools ? TOOLS_ADDENDUM : ""), c.get<string>("instructions") ?? "");
+  }
 
-    return runClaude({
-      prompt: buildPrompt(this.ctx, history, question),
-      systemPrompt,
-      model,
+  runOptions() {
+    const c = cfg();
+    return {
       effort: c.get<string>("effort") || undefined,
-      cwd: this.cwd,
       claudePath: c.get<string>("claudePath")?.trim() || undefined,
-      readOnlyTools: tools,
+      readOnlyTools: c.get<boolean>("allowReadOnlyTools", false),
       loadCustomizations: c.get<boolean>("loadClaudeCustomizations", false),
       timeoutMs: Math.max(10, c.get<number>("timeoutSeconds", 180)) * 1000,
-      signal: abort.signal,
-      log,
-      onText: (delta) => {
-        turn.answer += delta;
-        turn.status = "streaming";
-        this.scheduleRender();
-      },
-    }).then(
-      (result) => {
-        turn.answer = result.text.trim() || turn.answer;
-        turn.status = "done";
-        turn.durationMs = result.durationMs;
-        log(`answer done in ${result.durationMs ?? "?"}ms (${turn.answer.length} chars, model ${result.model})`);
-      },
-      (err: unknown) => {
-        if (abort.signal.aborted) {
-          turn.status = "stopped";
-        } else {
-          turn.status = "error";
-          const e = err as ClaudeError;
-          turn.error = e.hint ? `${e.message}\n\n${e.hint}` : String(e?.message ?? err);
-          log(`error: ${turn.error}`);
-        }
-      }
-    ).finally(() => {
-      if (this.abort === abort) this.abort = undefined;
-      this.render();
-      this.done.fire(turn);
-    });
-  }
-
-  stop(): void {
-    this.abort?.abort();
-    this.abort = undefined;
-  }
-
-  private scheduleRender(): void {
-    if (this.renderTimer) return;
-    this.renderTimer = setTimeout(() => {
-      this.renderTimer = undefined;
-      this.render();
-    }, 60);
-  }
-
-  render(): void {
-    if (this.disposed || !this.thread) return;
-    clearTimeout(this.renderTimer);
-    this.renderTimer = undefined;
-    for (const t of this.turns) {
-      const head = `*${escapeMarkdown(t.display)}*\n\n`;
-      let body: string;
-      switch (t.status) {
-        case "pending":
-          body = "_Thinking…_";
-          break;
-        case "streaming":
-          body = t.answer + " ▍";
-          break;
-        case "done":
-          body = t.answer || "_(empty answer)_";
-          break;
-        case "stopped":
-          body = (t.answer ? t.answer + "\n\n" : "") + "_(stopped)_";
-          break;
-        case "error":
-          body = (t.answer ? t.answer + "\n\n" : "") + `⚠️ ${escapeMarkdown(t.error ?? "Unknown error")}`;
-          break;
-      }
-      t.comment.body = new vscode.MarkdownString(head + body);
-      t.comment.label = t.durationMs ? `${t.model} · ${(t.durationMs / 1000).toFixed(1)}s` : t.model;
-    }
-    this.thread.comments = this.turns.map((t) => t.comment);
-    // Only push header changes when they differ; every thread update re-renders the widget.
-    const contextValue = this.busy ? "claudeExplain.busy" : "claudeExplain.idle";
-    if (this.thread.contextValue !== contextValue) this.thread.contextValue = contextValue;
-    const lines = this.ctx.startLine === this.ctx.endLine ? `line ${this.ctx.startLine}` : `lines ${this.ctx.startLine}–${this.ctx.endLine}`;
-    const label = `Claude · ${currentModel()} · ${lines}${this.busy ? " · thinking…" : ""}`;
-    if (this.thread.label !== label) this.thread.label = label;
-  }
-
-  dispose(): void {
-    if (this.disposed) return;
-    this.stop();
-    this.disposed = true;
-    clearTimeout(this.renderTimer);
-    this.thread?.dispose();
-    this.done.dispose();
-  }
-}
-
-// ---------------------------------------------------------------------------
-
-class ExplainController implements vscode.Disposable {
-  private readonly comments: vscode.CommentController;
-  session?: ExplainSession;
-  private readonly avatar: vscode.Uri;
-  private readonly disposables: vscode.Disposable[] = [];
-  // The one line where a commenting range is offered (the popover's anchor), so
-  // the built-in "Add Comment" can open a thread whose input is already focused.
-  private armed?: { uri: string; line: number; servedAt?: number };
-  private rangesServed?: (uri: string) => void;
-
-  constructor(context: vscode.ExtensionContext) {
-    this.avatar = vscode.Uri.joinPath(context.extensionUri, "media", "claude.svg");
-    this.comments = vscode.comments.createCommentController(CONTROLLER_ID, "Claude Inline Explain");
-    this.comments.options = {
-      prompt: "Add a follow-up…",
-      placeHolder: "Ask a quick question — Enter to send, Shift+Enter for a new line, empty = explain",
     };
-    this.setRangeProvider();
-    this.disposables.push(
-      this.comments,
-      vscode.workspace.onDidCloseTextDocument((doc) => {
-        if (this.session && this.session.uri.toString() === doc.uri.toString()) this.closeSession();
-      })
-    );
   }
 
-  // Opens run one at a time: an open temporarily moves the cursor to check the
-  // commenting range, and an overlapping open would save that as the selection.
-  private opening: Promise<unknown> = Promise.resolve();
-
-  open(uri?: vscode.Uri, range?: vscode.Range): Promise<ExplainSession | undefined> {
-    const run = this.opening.then(() => this.openNow(uri, range));
-    this.opening = run.catch((e) => log(`open failed: ${e}`));
-    return run;
+  style() {
+    const size = cfg().get<number>("fontSize", 0) || vscode.workspace.getConfiguration("editor").get<number>("fontSize", 14);
+    return { fontSize: size, fontFamily: cfg().get<string>("fontFamily", "")?.trim() ?? "" };
   }
 
-  private async openNow(uri?: vscode.Uri, range?: vscode.Range): Promise<ExplainSession | undefined> {
-    // While the popover input has focus there is no active text editor.
-    const editor = vscode.window.activeTextEditor ?? lastEditor();
-    let doc: vscode.TextDocument | undefined;
-    if (uri instanceof vscode.Uri) {
-      doc = vscode.workspace.textDocuments.find((d) => d.uri.toString() === uri.toString()) ?? (await vscode.workspace.openTextDocument(uri));
-    } else {
-      doc = editor?.document;
+  heightSetting() {
+    const id = cfg().get<string>("popoverHeight", "auto");
+    const h = HEIGHTS.find((x) => x.id === id) ?? HEIGHTS[0];
+    return { label: h.label, ratio: h.ratio };
+  }
+
+  selectHeight = selectHeight;
+
+  maxHeightRatio(): number {
+    return Math.min(0.95, Math.max(0.2, cfg().get<number>("maxHeight", 0.6)));
+  }
+
+  guardTyping(session: ExplainSession): void {
+    this.startTypeGuard(session);
+  }
+
+  onClosed(s: ExplainSession, byUserWhileFocused: boolean): void {
+    if (this.session !== s) return;
+    this.session = undefined;
+    this.endTypeGuard();
+    void vscode.commands.executeCommand("setContext", "claudeInlineExplain.popoverVisible", false);
+    lensEvents.fire();
+    // Esc/× from inside the popover: give the keyboard back to the code. Not on
+    // other closes, which would yank focus from wherever it is now.
+    if (byUserWhileFocused && vscode.window.visibleTextEditors.includes(s.editor)) {
+      void vscode.window.showTextDocument(s.editor.document, { viewColumn: s.editor.viewColumn, preserveFocus: false });
     }
-    if (!doc) {
-      log("explain: no editor to explain");
+  }
+
+  // -----------------------------------------------------------------------
+
+  async open(uri?: vscode.Uri, range?: vscode.Range): Promise<ExplainSession | undefined> {
+    let editor = vscode.window.activeTextEditor ?? lastEditor();
+    if (uri instanceof vscode.Uri && editor?.document.uri.toString() !== uri.toString()) {
+      editor = vscode.window.visibleTextEditors.find((e) => e.document.uri.toString() === uri.toString());
+      if (!editor) editor = await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(uri));
+    }
+    if (!editor) {
       vscode.window.showInformationMessage("Open a file and select some code to explain.");
       return;
     }
-    let sel: vscode.Range | undefined = range instanceof vscode.Range ? range : undefined;
-    if (!sel && editor && editor.document === doc) sel = editor.selection;
-    if (!sel || sel.isEmpty) {
-      // Nothing selected: fall back to the current line.
-      const line = doc.lineAt((sel ?? editor?.selection ?? new vscode.Range(0, 0, 0, 0)).start.line);
+    const doc = editor.document;
+    let sel: vscode.Range = range instanceof vscode.Range ? range : editor.selection;
+    if (sel.isEmpty) {
+      // Nothing selected: explain the current line.
+      const line = doc.lineAt(sel.start.line);
       if (line.isEmptyOrWhitespace) {
-        log("explain: empty selection on a blank line");
         vscode.window.showInformationMessage("Select some code to explain.");
         return;
       }
@@ -268,11 +120,15 @@ class ExplainController implements vscode.Disposable {
     }
     sel = normalizeSelection(doc, sel);
 
-    this.closeSession();
-    if (vscode.window.activeTextEditor?.document !== doc) await vscode.window.showTextDocument(doc);
+    // ⌘K again on the same selection just puts the cursor back in the popover.
+    const s = this.session;
+    if (s?.isOpen && s.editor === editor && s.selection.isEqual(sel)) {
+      s.focus();
+      return s;
+    }
+    s?.close("replaced by a new popover");
 
     const n = Math.max(0, cfg().get<number>("contextLines", 40));
-    const beforeStart = new vscode.Position(Math.max(0, sel.start.line - n), 0);
     const afterEndLine = Math.min(doc.lineCount - 1, sel.end.line + n);
     const ctx: CodeContext = {
       relativePath: doc.uri.scheme === "file" || doc.uri.scheme === "vscode-remote" ? vscode.workspace.asRelativePath(doc.uri) : doc.fileName || doc.uri.toString(),
@@ -280,221 +136,75 @@ class ExplainController implements vscode.Disposable {
       startLine: sel.start.line + 1,
       endLine: sel.end.line + 1,
       selection: doc.getText(sel),
-      before: doc.getText(new vscode.Range(beforeStart, sel.start)),
+      before: doc.getText(new vscode.Range(new vscode.Position(Math.max(0, sel.start.line - n), 0), sel.start)),
       after: doc.getText(new vscode.Range(sel.end, doc.lineAt(afterEndLine).range.end)),
     };
 
-    const anchorLine = anchorLineFor(sel);
-    const anchor = new vscode.Range(anchorLine, 0, anchorLine, 0);
+    // The inset is drawn after `anchor` (0-based); -1 puts it above line 1.
+    const above = cfg().get<string>("popoverPosition", "above") === "above";
+    const anchor = above ? sel.start.line - 1 : sel.end.line;
+    editor.revealRange(new vscode.Range(Math.max(0, anchor), 0, sel.start.line, 0), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
 
-    const session = new ExplainSession(doc.uri, sel, anchor, ctx, workingDirFor(doc.uri), this.avatar);
-    this.session = session;
-    log(`opening popover for ${ctx.relativePath}:${ctx.startLine}-${ctx.endLine} (anchor line ${anchorLine + 1})`);
-
-    const shown = vscode.window.visibleTextEditors.find((e) => e.document === doc);
-    shown?.revealRange(new vscode.Range(anchor.start, sel.start), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
-    lensEvents.fire();
-
-    // Extension-created threads start with a collapsed input, and the API that
-    // could focus it is a proposal Cursor blocks. A thread opened through the
-    // built-in "Add Comment" starts expanded and focused, so offer a commenting
-    // range on the anchor line and open the thread there.
-    // "Add Comment" fails with "The cursor must be within a commenting range" if
-    // the editor hasn't applied our range yet, so offer it and wait until it has.
-    if (testHooks.skipArmWait) this.prearm(doc, sel);
-    else await this.arm(doc.uri, anchorLine);
-    if (this.session !== session) return session;
-    const ed = vscode.window.visibleTextEditors.find((e) => e.document === doc);
-    let ready = !ed || (await this.waitForRange(ed, anchorLine, session, 1500));
-    if (!ready && ed && this.session === session) {
-      // The window's commenting is switched off (Zen mode, "Toggle Editor
-      // Commenting", or comments.visible: false), so the editor never asks for
-      // ranges. Switch it on, as the editor's own "reveal comment" does.
-      log("commenting range not applied; turning on editor commenting and retrying");
-      await vscode.commands.executeCommand("workbench.action.toggleCommenting");
-      await this.arm(doc.uri, anchorLine, true);
-      ready = await this.waitForRange(ed, anchorLine, session, 2500);
-      if (!ready) {
-        await vscode.commands.executeCommand("workbench.action.toggleCommenting"); // leave it as we found it
+    const session = new ExplainSession(editor, sel, anchor, ctx, workingDirFor(doc.uri), this);
+    this.startTypeGuard(session);
+    try {
+      session.open();
+    } catch (e) {
+      this.endTypeGuard();
+      if (e instanceof InsetUnavailableError) {
+        log(`inset API unavailable: ${e.message}`);
+        void showInsetHelp(this.context, e.message);
+        return;
       }
+      throw e;
     }
-    if (this.session !== session) return session;
-    if (!ready) {
-      log(`commenting range on line ${anchorLine + 1} never became available; not opening the popover`);
-      this.closeSession();
-      vscode.window.showWarningMessage(
-        "Claude Inline Explain couldn't open its popover because the editor isn't accepting comments here. Try “Comments: Toggle Editor Commenting”, leave Zen mode, or check the comments.visible setting."
-      );
-      return undefined;
-    }
-    await vscode.commands.executeCommand("workbench.action.addComment", {
-      range: { startLineNumber: anchorLine + 1, endLineNumber: anchorLine + 1, endColumn: 1 },
-    });
+    this.session = session;
+    void vscode.commands.executeCommand("setContext", "claudeInlineExplain.popoverVisible", true);
+    log(`opened popover for ${ctx.relativePath}:${ctx.startLine}-${ctx.endLine}`);
+    lensEvents.fire();
     return session;
   }
 
-  // Asks the editor to jump to its next commenting range, which reads the same
-  // list "Add Comment" checks, then puts the user's selection back. Lands on the
-  // anchor line only once the editor has applied our range.
-  private async waitForRange(ed: vscode.TextEditor, line: number, session: ExplainSession, timeoutMs: number): Promise<boolean> {
-    const saved = ed.selections;
-    const top = ed.visibleRanges[0]?.start;
-    const end = Date.now() + timeoutMs;
+  // Until the popover's webview loads and takes focus (~0.2s), keystrokes still
+  // go to the code editor. Catch typed text for that moment and hand it to the
+  // popover instead of letting it edit the file.
+  private startTypeGuard(session: ExplainSession): void {
+    this.endTypeGuard();
     try {
-      while (Date.now() < end && this.session === session) {
-        ed.selection = new vscode.Selection(0, 0, 0, 0);
-        await vscode.commands.executeCommand("editor.action.nextCommentingRange");
-        if (ed.selection.active.line === line) return true;
-        await new Promise((r) => setTimeout(r, 50));
-      }
-      return false;
-    } finally {
-      ed.selections = saved;
-      // The jump can scroll; put the view back where it was.
-      if (top) ed.revealRange(new vscode.Range(top, top), vscode.TextEditorRevealType.AtTop);
+      this.typeGuard = vscode.commands.registerCommand("type", (args: { text?: string }) => {
+        if (args?.text) session.addEarlyKeys(args.text);
+      });
+    } catch {
+      return; // another extension (e.g. Vim) owns "type"; skip the guard
     }
-  }
-
-  // Called when a selection settles, so the range is usually ready by the time
-  // the user presses ⌘K.
-  prearm(doc: vscode.TextDocument, sel: vscode.Range): void {
-    const line = anchorLineFor(normalizeSelection(doc, sel));
-    const a = this.armed;
-    if (a && a.uri === doc.uri.toString() && a.line === line) return;
-    this.armed = { uri: doc.uri.toString(), line };
-    this.setRangeProvider();
-  }
-
-  // Drop a pre-armed range when the selection goes away and no popover is open.
-  unprearm(): void {
-    if (!this.session) this.disarm();
-  }
-
-  private setRangeProvider(): void {
-    // Reassigning the provider makes the editor ask for ranges again.
-    this.comments.commentingRangeProvider = {
-      provideCommentingRanges: (doc) => {
-        const a = this.armed;
-        if (!a || a.uri !== doc.uri.toString()) return [];
-        queueMicrotask(() => {
-          a.servedAt = Date.now();
-          this.rangesServed?.(doc.uri.toString());
-        });
-        return [new vscode.Range(a.line, 0, a.line, 0)];
-      },
+    let sawBlur = !session.inputFocused;
+    const poll = () => {
+      if (!session.inputFocused) sawBlur = true;
+      if (!session.isOpen || (sawBlur && session.inputFocused)) return this.endTypeGuard();
+      this.typeGuardTimer = setTimeout(poll, 40);
     };
+    poll();
+    this.typeGuardLimit = setTimeout(() => this.endTypeGuard(), 3000);
   }
 
-  private async arm(uri: vscode.Uri, line: number, refresh = false): Promise<void> {
-    const key = uri.toString();
-    const settle = refresh ? 400 : 0;
-    const a = this.armed;
-    if (!refresh && a && a.uri === key && a.line === line && a.servedAt !== undefined) {
-      const age = Date.now() - a.servedAt;
-      if (age < settle) await new Promise((r) => setTimeout(r, settle - age));
-      return;
-    }
-    this.armed = { uri: key, line };
-    const served = new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, 1000);
-      this.rangesServed = (u) => {
-        if (u !== uri.toString()) return;
-        clearTimeout(timer);
-        this.rangesServed = undefined;
-        resolve();
-      };
-    });
-    this.setRangeProvider();
-    await served;
-    await new Promise((r) => setTimeout(r, settle));
+  private endTypeGuard(): void {
+    clearTimeout(this.typeGuardTimer);
+    clearTimeout(this.typeGuardLimit);
+    this.typeGuard?.dispose();
+    this.typeGuard = undefined;
   }
 
-  private disarm(): void {
-    if (!this.armed) return;
-    this.armed = undefined;
-    this.setRangeProvider();
+  close(): void {
+    this.session?.close("closed by user");
   }
 
-  submit(reply: vscode.CommentReply | undefined): Promise<void> | undefined {
-    const session = this.sessionFor(reply?.thread);
-    if (!session) {
-      reply?.thread.dispose(); // a thread from an earlier session
-      return;
-    }
-    const text = (reply?.text ?? "").trim();
-    const question = text || cfg().get<string>("defaultQuestion") || "Explain what this code does.";
-    return session.ask(question, text || "explain");
-  }
-
-  // Enter in an empty input. The built-in submit ignores empty input, so this
-  // asks the default question itself.
-  async explainFromEmptyInput(): Promise<void> {
-    const s = this.session;
-    if (!s) return;
-    if (!s.thread) {
-      // Still the built-in template thread: collapsing an empty thread deletes it.
-      await vscode.commands.executeCommand("workbench.action.hideComment");
-      s.attach(this.comments.createCommentThread(s.uri, s.anchor, []));
-      this.restoreSelection(s);
-    }
-    await s.ask(cfg().get<string>("defaultQuestion") || "Explain what this code does.", "explain");
-  }
-
-  // Collapsing a thread moves the editor selection onto the thread's line.
-  private restoreSelection(s: ExplainSession): void {
-    const ed = vscode.window.visibleTextEditors.find((e) => e.document.uri.toString() === s.uri.toString());
-    if (ed) ed.selection = new vscode.Selection(s.selection.start, s.selection.end);
-  }
-
-  stop(arg?: vscode.CommentThread | vscode.CommentReply): void {
-    this.sessionFor(arg)?.stop();
-    this.session?.render();
-  }
-
-  closeSession(arg?: vscode.CommentThread | vscode.CommentReply, fromInput = false): void {
-    const thread = arg && ("thread" in arg ? arg.thread : arg);
-    const s = arg ? this.sessionFor(arg) : this.session;
-    log(`close: arg=${arg ? "yes" : "no"} fromInput=${fromInput} session=${!!s} adopted=${!!s?.thread}`);
-    if (s && !s.thread && !thread) {
-      // The popover is still the built-in template thread, which we have no
-      // handle to. Collapsing an empty thread deletes it. "hideComment" only
-      // works from the focused input; otherwise collapse the editor's threads.
-      void vscode.commands.executeCommand(fromInput ? "workbench.action.hideComment" : "workbench.action.collapseAllComments").then(
-        () => this.restoreSelection(s),
-        (e) => log(`could not close popover: ${e}`)
-      );
-    }
-    if (thread && thread !== s?.thread) thread.dispose();
-    if (!s) return;
-    s.dispose();
-    if (s === this.session) {
-      this.session = undefined;
-      this.disarm();
-    }
-    lensEvents.fire();
-  }
-
-  refreshLabels(): void {
-    this.session?.render();
-  }
-
-  // Finds the session a thread belongs to. The first time the popover's
-  // template thread reaches us (submit or a title button), it is adopted.
-  private sessionFor(arg?: vscode.CommentThread | vscode.CommentReply): ExplainSession | undefined {
-    const s = this.session;
-    if (!arg || !s) return s;
-    const thread = "thread" in arg ? arg.thread : arg;
-    if (s.thread === thread) return s;
-    if (!s.thread && thread.uri.toString() === s.uri.toString()) {
-      s.attach(thread);
-      return s;
-    }
-    return undefined;
+  stop(): void {
+    this.session?.stop();
   }
 
   dispose(): void {
-    this.closeSession();
-    this.disposables.forEach((d) => d.dispose());
+    this.session?.close("extension deactivated");
+    this.endTypeGuard();
   }
 }
 
@@ -506,16 +216,6 @@ function normalizeSelection(doc: vscode.TextDocument, sel: vscode.Range): vscode
   return sel;
 }
 
-// Comment widgets render below their range's last line, so anchor on the line
-// above the selection to show the popover on top of it.
-function anchorLineFor(sel: vscode.Range): number {
-  const above = cfg().get<string>("popoverPosition", "above") === "above" && sel.start.line > 0;
-  return above ? sel.start.line - 1 : sel.end.line;
-}
-
-// Switches used only by the integration tests.
-export const testHooks = { skipArmWait: false };
-
 let lastActiveEditor: vscode.TextEditor | undefined;
 function lastEditor(): vscode.TextEditor | undefined {
   return lastActiveEditor && vscode.window.visibleTextEditors.includes(lastActiveEditor) ? lastActiveEditor : undefined;
@@ -526,6 +226,103 @@ function workingDirFor(uri: vscode.Uri): string {
   if (folder?.uri.scheme === "file") return folder.uri.fsPath;
   if (uri.scheme === "file") return path.dirname(uri.fsPath);
   return os.homedir();
+}
+
+// ---------------------------------------------------------------------------
+// One-time setup: the popover uses the proposed "editorInsets" API, which the
+// editor only allows for extensions listed under enable-proposed-api in argv.json.
+
+function argvFile(): string {
+  return argv.argvPath(vscode.env.appRoot);
+}
+
+// Cursor binds ⌘K to its own Quick Edit at a priority no extension keybinding
+// can beat, so ⌘K (and Esc) have to be user keybindings. Appends them to the
+// user's keybindings.json (opened through the editor, so profiles work and the
+// edit can be undone). Returns true if anything was added.
+const KEY_K = process.platform === "darwin" ? "cmd+k" : "ctrl+k";
+const USER_KEYBINDINGS = [
+  { key: KEY_K, command: "claudeInlineExplain.explain", when: "editorTextFocus && editorHasSelection" },
+  {
+    key: "escape",
+    command: "claudeInlineExplain.close",
+    when: "claudeInlineExplain.popoverVisible && editorTextFocus && !editorHasSelection && !editorHasMultipleSelections && !suggestWidgetVisible && !findWidgetVisible && !inSnippetMode && !parameterHintsVisible && !renameInputVisible && !inlineSuggestionVisible",
+  },
+];
+
+async function addUserKeybindings(): Promise<boolean> {
+  await vscode.commands.executeCommand("workbench.action.openGlobalKeybindingsFile");
+  const ed = vscode.window.activeTextEditor;
+  if (!ed || !/keybindings\.json$/i.test(ed.document.fileName)) {
+    log("couldn't open keybindings.json");
+    return false;
+  }
+  const text = ed.document.getText();
+  let existing: any[] = [];
+  try {
+    existing = JSON.parse(argv.blankComments(text).replace(/,(\s*[\]}])/g, "$1") || "[]");
+  } catch {
+    vscode.window.showWarningMessage("Your keybindings.json has a syntax error, so ⌘K wasn't added. Fix it and run the setup again.");
+    return false;
+  }
+  const missing = USER_KEYBINDINGS.filter((k) => !existing.some((e) => e?.key === k.key && e?.command === k.command));
+  if (!missing.length) return false;
+
+  const blanked = argv.blankComments(text);
+  const close = blanked.lastIndexOf("]");
+  if (close < 0) return false;
+  let at = close;
+  while (at > 0 && /\s/.test(blanked[at - 1])) at--;
+  const needsComma = blanked[at - 1] !== "[" && blanked[at - 1] !== ",";
+  const body = missing.map((k) => JSON.stringify(k, null, 4).replace(/^/gm, "    ")).join(",\n");
+  const insert = `${needsComma ? "," : ""}\n    // Claude Inline Explain: ${KEY_K} explains the selection; Esc closes its popover.\n${body}\n`;
+  const pos = ed.document.positionAt(at);
+  await ed.edit((eb) => eb.insert(pos, insert));
+  await ed.document.save();
+  log(`added ${missing.length} keybinding(s) to ${ed.document.fileName}`);
+  return true;
+}
+
+async function enableInlinePopover(context: vscode.ExtensionContext): Promise<void> {
+  const file = argvFile();
+  const id = context.extension.id;
+  try {
+    const changed = argv.enable(file, id);
+    log(changed ? `added ${id} to ${argv.ARGV_KEY} in ${file}` : `${id} already in ${file}`);
+  } catch (e) {
+    vscode.window.showErrorMessage(`Couldn't update ${file}: ${e instanceof Error ? e.message : e}`);
+    return;
+  }
+  await addUserKeybindings();
+  const appName = vscode.env.appName;
+  const pick = await vscode.window.showInformationMessage(
+    `Claude Inline Explain is set up in ${file}. Quit and reopen ${appName} to turn the popover on (reloading the window isn't enough).`,
+    `Quit ${appName}`,
+    "Later"
+  );
+  if (pick?.startsWith("Quit")) void vscode.commands.executeCommand("workbench.action.quit");
+}
+
+async function showInsetHelp(context: vscode.ExtensionContext, detail: string): Promise<void> {
+  const file = argvFile();
+  const id = context.extension.id;
+  if (!argv.isEnabled(file, id)) {
+    const pick = await vscode.window.showWarningMessage(
+      `Claude Inline Explain needs one-time setup to draw its popover: allow it to use the editor's inline webview API in ${file}, then restart ${vscode.env.appName}.`,
+      "Set up now",
+      "How it works"
+    );
+    if (pick === "Set up now") await enableInlinePopover(context);
+    if (pick === "How it works") void vscode.env.openExternal(vscode.Uri.parse(README_TROUBLESHOOTING));
+    return;
+  }
+  const pick = await vscode.window.showErrorMessage(
+    `Claude Inline Explain can't draw its popover even though ${file} enables it. Either ${vscode.env.appName} hasn't been fully restarted since, or an update changed or removed the API it uses. (${detail})`,
+    "Troubleshooting",
+    "Show logs"
+  );
+  if (pick === "Troubleshooting") void vscode.env.openExternal(vscode.Uri.parse(README_TROUBLESHOOTING));
+  if (pick === "Show logs") output.show();
 }
 
 // ---------------------------------------------------------------------------
@@ -542,7 +339,7 @@ class ExplainCodeLensProvider implements vscode.CodeLensProvider {
     if (stableSelection.uri !== doc.uri.toString()) return [];
     const range = stableSelection.range;
     const s = controller.session;
-    if (s && s.uri.toString() === doc.uri.toString() && s.selection.isEqual(range)) return [];
+    if (s?.isOpen && s.uri.toString() === doc.uri.toString() && s.selection.isEqual(normalizeSelection(doc, range))) return [];
     const at = new vscode.Range(range.start.line, 0, range.start.line, 0);
     return [
       new vscode.CodeLens(at, {
@@ -584,17 +381,14 @@ function trackSelection(context: vscode.ExtensionContext): void {
     const changed = next?.uri !== stableSelection?.uri || !(next && stableSelection && next.range.isEqual(stableSelection.range));
     stableSelection = next;
     if (changed) lensEvents.fire();
-    if (editor && next) controller.prearm(editor.document, next.range);
-    else if (changed) controller.unprearm();
 
     for (const e of vscode.window.visibleTextEditors) {
       if (e !== editor || !next || !cfg().get<boolean>("showInlineHint", false)) {
         e.setDecorations(hintDecoration, []);
         continue;
       }
-      let endLine = next.range.end.line;
-      if (next.range.end.character === 0 && endLine > next.range.start.line) endLine--;
-      const eol = e.document.lineAt(endLine).range.end;
+      const end = normalizeSelection(e.document, next.range).end;
+      const eol = e.document.lineAt(end.line).range.end;
       e.setDecorations(hintDecoration, [new vscode.Range(eol, eol)]);
     }
   };
@@ -630,6 +424,24 @@ const MODEL_CHOICES: { id: string; detail: string }[] = [
   { id: "default", detail: "Whatever your Claude Code CLI is configured to use" },
 ];
 
+const HEIGHTS: { id: string; label: string; ratio?: number; detail: string }[] = [
+  { id: "auto", label: "Auto", detail: "Fit the answer, up to claudeInlineExplain.maxHeight of the editor" },
+  { id: "small", label: "Small", ratio: 0.25, detail: "About a quarter of the visible editor" },
+  { id: "medium", label: "Medium", ratio: 0.4, detail: "About 40% of the visible editor" },
+  { id: "large", label: "Large", ratio: 0.6, detail: "About 60% of the visible editor" },
+  { id: "xlarge", label: "Extra large", ratio: 0.8, detail: "About 80% of the visible editor" },
+];
+
+async function selectHeight(): Promise<void> {
+  const current = cfg().get<string>("popoverHeight", "auto");
+  const pick = await vscode.window.showQuickPick(
+    HEIGHTS.map((h) => ({ label: h.label, detail: h.detail, id: h.id, description: h.id === current ? "current" : undefined })),
+    { title: "Claude Inline Explain: popover height", placeHolder: "Height of the popover while it shows answers" }
+  );
+  if (!pick) return;
+  await cfg().update("popoverHeight", pick.id, settingTarget("popoverHeight"));
+}
+
 async function selectModel(): Promise<void> {
   const current = currentModel();
   const items: (vscode.QuickPickItem & { id?: string })[] = MODEL_CHOICES.map((m) => ({
@@ -642,9 +454,8 @@ async function selectModel(): Promise<void> {
   const pick = await vscode.window.showQuickPick(items, { title: "Claude Inline Explain: model", placeHolder: `Current: ${current}` });
   if (!pick) return;
   const c = cfg();
-  const target = settingTarget("model");
   if (pick.id) {
-    await c.update("model", pick.id, target);
+    await c.update("model", pick.id, settingTarget("model"));
     if (c.get<string>("customModel")) await c.update("customModel", "", settingTarget("customModel"));
   } else {
     const value = await vscode.window.showInputBox({ title: "Custom model", prompt: "Model name or alias passed to claude --model", value: c.get<string>("customModel") || "" });
@@ -664,7 +475,6 @@ function settingTarget(key: string): vscode.ConfigurationTarget {
 
 export interface InlineExplainApi {
   readonly session: ExplainSession | undefined;
-  readonly testHooks: typeof testHooks;
   open(uri?: vscode.Uri, range?: vscode.Range): Promise<ExplainSession | undefined>;
   currentModel(): string;
 }
@@ -693,21 +503,15 @@ export function activate(context: vscode.ExtensionContext): InlineExplainApi {
       providedCodeActionKinds: [ExplainCodeActionProvider.kind],
     }),
     vscode.commands.registerCommand("claudeInlineExplain.explain", (uri?: vscode.Uri, range?: vscode.Range) => controller.open(uri, range)),
-    // Don't return the answer promise: the editor clears and collapses the input
-    // only after this command resolves, which would wipe a follow-up typed meanwhile.
-    vscode.commands.registerCommand("claudeInlineExplain.submit", (reply: vscode.CommentReply) => {
-      void controller.submit(reply);
+    vscode.commands.registerCommand("claudeInlineExplain.close", () => controller.close()),
+    vscode.commands.registerCommand("claudeInlineExplain.stop", () => controller.stop()),
+    vscode.commands.registerCommand("claudeInlineExplain.selectModel", async () => {
+      await selectModel();
+      controller.session?.refreshHeader();
     }),
-    vscode.commands.registerCommand("claudeInlineExplain.stop", (arg?: vscode.CommentThread) => controller.stop(arg)),
-    vscode.commands.registerCommand("claudeInlineExplain.close", (arg?: vscode.CommentThread | vscode.CommentReply) => controller.closeSession(arg, !arg)),
-    vscode.commands.registerCommand("claudeInlineExplain.explainFromEmptyInput", () => controller.explainFromEmptyInput()),
-    vscode.commands.registerCommand("claudeInlineExplain.copyAnswer", async (comment?: AnswerComment) => {
-      const turn = comment?.turn ?? controller.session?.turns.at(-1);
-      if (!turn?.answer) return;
-      await vscode.env.clipboard.writeText(turn.answer);
-      vscode.window.setStatusBarMessage("Copied Claude's answer", 2000);
-    }),
-    vscode.commands.registerCommand("claudeInlineExplain.selectModel", selectModel),
+    vscode.commands.registerCommand("claudeInlineExplain.selectHeight", () => selectHeight()),
+    vscode.commands.registerCommand("claudeInlineExplain.enableInlinePopover", () => enableInlinePopover(context)),
+    vscode.commands.registerCommand("claudeInlineExplain.addKeybindings", () => addUserKeybindings()),
     vscode.commands.registerCommand("claudeInlineExplain.openSettings", () =>
       vscode.commands.executeCommand("workbench.action.openSettings", `@ext:${context.extension.id}`)
     ),
@@ -719,18 +523,25 @@ export function activate(context: vscode.ExtensionContext): InlineExplainApi {
       if (!e.affectsConfiguration(CFG)) return;
       if (e.affectsConfiguration(`${CFG}.claudePath`)) resetAuthCache();
       updateStatus();
-      controller.refreshLabels();
+      controller.session?.refreshHeader();
+      if (e.affectsConfiguration(`${CFG}.popoverHeight`) || e.affectsConfiguration(`${CFG}.maxHeight`)) {
+        controller.session?.applyHeight(!!controller.session?.inputFocused);
+      }
       lensEvents.fire();
     })
   );
   trackSelection(context);
   log(`activated (model ${currentModel()})`);
 
+  // Remind once per session if the one-time setup hasn't been done.
+  if (!argv.isEnabled(argvFile(), context.extension.id) && !process.env.CIE_DEBUG) {
+    void showInsetHelp(context, "not set up yet");
+  }
+
   return {
     get session() {
       return controller.session;
     },
-    testHooks,
     open: (uri, range) => controller.open(uri, range),
     currentModel,
   };

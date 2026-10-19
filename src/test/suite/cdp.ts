@@ -40,7 +40,14 @@ export class Cdp {
     return r.result.value as T;
   }
 
+  // Tests share the desktop with other apps; make this the active window
+  // before input so keyboard focus behaves as it does for a person.
+  async front(): Promise<void> {
+    await this.send("Page.bringToFront");
+  }
+
   async click(x: number, y: number): Promise<void> {
+    await this.front();
     for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
       await this.send("Input.dispatchMouseEvent", { type, x, y, button: "left", clickCount: 1 });
     }
@@ -51,14 +58,30 @@ export class Cdp {
   }
 
   async press(key: "Enter" | "Escape"): Promise<void> {
+    await this.front();
     const code = key === "Enter" ? 13 : 27;
     await this.send("Input.dispatchKeyEvent", { type: "rawKeyDown", key, code: key, windowsVirtualKeyCode: code, nativeVirtualKeyCode: code });
     if (key === "Enter") await this.send("Input.dispatchKeyEvent", { type: "char", key, text: "\r", unmodifiedText: "\r" });
     await this.send("Input.dispatchKeyEvent", { type: "keyUp", key, code: key, windowsVirtualKeyCode: code, nativeVirtualKeyCode: code });
   }
 
+  // Types like a keyboard: one keydown/char/keyup per character.
+  async typeKeys(text: string): Promise<void> {
+    await this.front();
+    for (const ch of text) {
+      const upper = ch.toUpperCase();
+      const isLetter = /[a-z]/i.test(ch);
+      const code = ch === " " ? "Space" : isLetter ? "Key" + upper : /[0-9]/.test(ch) ? "Digit" + ch : "";
+      const keyCode = ch === " " ? 32 : isLetter || /[0-9]/.test(ch) ? upper.charCodeAt(0) : 0;
+      const base = { key: ch, code, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode, modifiers: ch !== ch.toLowerCase() ? 8 : 0 };
+      await this.send("Input.dispatchKeyEvent", { type: "keyDown", text: ch, unmodifiedText: ch, ...base });
+      await this.send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+    }
+  }
+
   // modifiers: Alt=1, Ctrl=2, Meta=4, Shift=8
   async chord(key: string, code: string, keyCode: number, modifiers: number): Promise<void> {
+    await this.front();
     const base = { key, code, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode, modifiers };
     await this.send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base });
     await this.send("Input.dispatchKeyEvent", { type: "keyUp", ...base });

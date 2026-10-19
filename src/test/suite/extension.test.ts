@@ -39,8 +39,8 @@ describe("Claude Inline Explain (real editor, inline popover, real Claude Code)"
     await cdp.front();
     const p = await cdp.eval<{ x: number; y: number } | null>(`(() => {
       const lines = [...document.querySelectorAll(".editor-group-container .monaco-editor .margin-view-overlays .line-numbers")].filter(l => l.offsetParent && l.getBoundingClientRect().height > 0);
-      const l = lines[lines.length - 1]; if (!l) return null;
-      const r = l.getBoundingClientRect(); return { x: r.x + 4, y: r.y + r.height / 2 };
+      const l = lines[Math.floor(lines.length / 2)]; if (!l) return null; // middle: away from edges and resize handles
+      const r = l.getBoundingClientRect(); return { x: r.right - 6, y: r.y + r.height / 2 }; // on the number, not the breakpoint gutter
     })()`);
     if (p) {
       const hit = await cdp.eval<string>(`(() => { const e = document.elementFromPoint(${p.x}, ${p.y}); return e ? e.tagName + "." + String(e.className).slice(0, 50) : "none"; })()`);
@@ -172,8 +172,13 @@ describe("Claude Inline Explain (real editor, inline popover, real Claude Code)"
     assert.match(turn.answer, /interceptor|toast/i);
     assert.strictEqual(s.draft, "", "the sent question doesn't come back into the input");
     await waitFocused(s, "input keeps focus after answering", 5000);
-    await sleep(1800); // fit-to-content happens once typing is idle
+    await sleep(500);
     await cdp.screenshot(shotsDir, "4-answer");
+    // While the cursor is in the popover it never rebuilds (keys typed then would
+    // be lost); clicking back into the code shrinks it to fit the answer.
+    const tall = s.heightLines;
+    await clickCode();
+    await waitFor("popover shrinks to fit once the user leaves it", () => s.heightLines < tall, 5000);
   });
 
   it("follow-up questions keep the conversation and use the model from settings", async () => {
@@ -196,7 +201,8 @@ describe("Claude Inline Explain (real editor, inline popover, real Claude Code)"
       assert.strictEqual(t2.status, "done", t2.error);
       assert.strictEqual(t2.model, "haiku");
       assert.strictEqual(s.turns.length, 2);
-      await sleep(1800);
+      assert.match(t2.question, /^and invalidateQueries\? one sentence$/, "every key of the follow-up arrived");
+      await sleep(500);
       await cdp.screenshot(shotsDir, "5-follow-up");
     } finally {
       await cfg().update("model", "sonnet", vscode.ConfigurationTarget.Global);
@@ -320,21 +326,21 @@ describe("Claude Inline Explain (real editor, inline popover, real Claude Code)"
       await cdp.typeKeys("one sentence please");
       await cdp.press("Enter");
       assert.strictEqual((await done).status, "done");
-      await sleep(1800); // auto: shrinks to fit the short answer
       const autoLines = s.heightLines;
 
       await clickControl(s, "height");
       await waitFor("height picker", () => cdp.eval<boolean>(`!!document.querySelector(".quick-input-widget") && getComputedStyle(document.querySelector(".quick-input-widget")).display !== "none"`), 5000);
-      await cdp.typeKeys("Extra large");
+      await cdp.typeKeys("Small");
       await cdp.press("Enter");
-      await waitFor("setting saved", () => cfg().get("popoverHeight") === "xlarge", 5000);
-      await waitFor("popover grew", () => s.heightLines > autoLines, 5000);
+      await waitFor("setting saved", () => cfg().get("popoverHeight") === "small", 5000);
+      await waitFor("popover shrank", () => s.heightLines < autoLines, 5000);
       await waitFocused(s, "input focused after picking a height");
-      const big = s.heightLines;
-      await cdp.screenshot(shotsDir, "7-height-xlarge");
+      const small = s.heightLines;
 
-      await cfg().update("popoverHeight", "small", vscode.ConfigurationTarget.Global);
-      await waitFor("popover shrank from settings", () => s.heightLines < big, 5000);
+      await cfg().update("popoverHeight", "xlarge", vscode.ConfigurationTarget.Global);
+      await waitFor("popover grew from settings", () => s.heightLines > small, 5000);
+      await sleep(400);
+      await cdp.screenshot(shotsDir, "7-height-xlarge");
       assert.strictEqual(s.turns.length, 1, "conversation kept across resizes");
     } finally {
       await cfg().update("popoverHeight", undefined, vscode.ConfigurationTarget.Global);

@@ -65,6 +65,7 @@
   }
 
   function renderHeader() {
+    document.querySelector(".pop").classList.toggle("fill", !!state.fill);
     $("model").textContent = state.model + " ▾";
     $("height").textContent = "↕ " + (state.height || "Auto") + " ▾";
     $("where").textContent = state.where;
@@ -197,6 +198,7 @@
         state.model = m.model;
         state.where = m.where;
         state.height = m.height;
+        state.fill = m.fill;
         renderHeader();
         break;
       case "focus":

@@ -2,7 +2,7 @@
   "name": "claude-inline-explain",
   "displayName": "Claude Inline Explain",
   "description": "Select code, press ⌘K, and ask Claude Code about it in an inline popover. Uses your local Claude Code CLI and its subscription login — never an API key.",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "publisher": "draac0",
   "license": "MIT",
   "engines": {

@@ -83,7 +83,7 @@ Click **↕** in the popover header (or run **Claude Inline Explain: Set Popover
 
 | Choice | Height while showing answers |
 | --- | --- |
-| **Auto** (default) | Grows while the answer streams, then shrinks to fit it, up to `claudeInlineExplain.maxHeight` (60% of the visible editor by default). |
+| **Auto** (default) | Grows while the answer streams, up to `claudeInlineExplain.maxHeight` (60% of the visible editor by default). Afterwards the card fits the answer, and the leftover space is given back when you click back into your code. |
 | **Small** | About 25% of the visible editor. |
 | **Medium** | About 40%. |
 | **Large** | About 60%. |
@@ -170,7 +170,7 @@ A webview inset is a real HTML page that the editor draws in a *view zone* betwe
 
 ### Behaviour worth knowing
 
-- **Height:** an inset's height (in editor lines) is fixed when it's created. The popover opens small and is rebuilt at the chosen height (or, in `auto`, its maximum) when you send a question; in `auto` it shrinks to fit once the answer is done and you've stopped typing. Each rebuild carries over the conversation, your draft and the input focus.
+- **Height:** an inset's height (in editor lines) is fixed when it's created, so resizing means rebuilding the webview (state, draft and focus carry over). For about 0.3 s during a rebuild there is no input, so the popover only rebuilds when you can't be mid-typing: when you press Enter (it grows to the chosen height, or the maximum in `auto`), when you change the height, and, in `auto`, after you leave the popover (it shrinks to fit). While you're in it, the card shrinks to its content with CSS instead. Each rebuild carries over the conversation, your draft and the input focus.
 - **Focus:** a new webview doesn't have keyboard focus. The popover takes it with `window.focus()` and retries for up to 1.5 s, or until it becomes visible if the window was in the background. Until then, the extension briefly takes over the editor's `type` command so that keys you press go into the popover, not your code. If another extension owns `type` (for example Vim), that guard is skipped.
 - **Width:** the inset is as wide as the editor's scrollable content. The popover measures how much of it is actually visible (an `IntersectionObserver`) and fits its card to that.
 

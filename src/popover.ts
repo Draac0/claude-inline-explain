@@ -62,7 +62,6 @@ export class ExplainSession {
   private closed = false;
   private pxPerLine = editorLineHeightPx();
   private contentPx = 0;
-  private lastDraftAt = 0;
   private fitTimer?: NodeJS.Timeout;
   private pendingDraft = "";
   private focusOnReady = true;
@@ -178,8 +177,15 @@ export class ExplainSession {
     return `${file} · ${startLine === endLine ? `line ${startLine}` : `lines ${startLine}–${endLine}`}`;
   }
 
+  // fill: the card takes the inset's full height (streaming, or a fixed size).
+  // Otherwise it shrinks to its content, and the inset itself shrinks later,
+  // once the user isn't typing in it (see scheduleFit).
+  private fill(): boolean {
+    return this.busy || !!this.host.heightSetting().ratio;
+  }
+
   private postHeader(): void {
-    this.inset?.webview.postMessage({ t: "header", busy: this.busy, model: this.host.currentModel(), where: this.where(), height: this.host.heightSetting().label });
+    this.inset?.webview.postMessage({ t: "header", busy: this.busy, model: this.host.currentModel(), where: this.where(), height: this.host.heightSetting().label, fill: this.fill() });
   }
 
   refreshHeader(): void {
@@ -194,7 +200,7 @@ export class ExplainSession {
         this.pendingDraft = "";
         this.inset?.webview.postMessage({
           t: "init",
-          state: { turns: this.turns, busy: this.busy, model: this.host.currentModel(), where: this.where(), height: this.host.heightSetting().label },
+          state: { turns: this.turns, busy: this.busy, model: this.host.currentModel(), where: this.where(), height: this.host.heightSetting().label, fill: this.fill() },
           style: this.host.style(),
           draft: this.draftForInit(draft),
           focus: this.focusOnReady,
@@ -205,14 +211,13 @@ export class ExplainSession {
       case "focus":
         this.inputFocused = !!m.focused;
         this.host.log(`popover input ${m.focused ? "focused" : "blurred"}`);
+        if (!this.inputFocused) this.scheduleFit();
         break;
       case "debug":
         this.host.log(`webview: ${m.text}`);
         break;
       case "draft":
         this.draft = String(m.text ?? "");
-        this.lastDraftAt = Date.now();
-        if (!this.draft && !this.busy) this.scheduleFit();
         break;
       case "ask":
         void this.ask(String(m.text ?? ""));
@@ -318,19 +323,16 @@ export class ExplainSession {
 
   private refocusAfterHeight = false;
 
-  // Shrink to fit after an answer, but not while the user is typing: a rebuild
-  // briefly has no focused input.
+  // Shrink the inset to fit after an answer, but only while the user isn't in
+  // the popover: a rebuild briefly has no input, and keys typed then are lost.
+  // Until then the card itself shrinks to its content (see fill()).
   private scheduleFit(): void {
     clearTimeout(this.fitTimer);
-    const wait = 1200 - (Date.now() - this.lastDraftAt);
-    if (wait > 0) {
-      this.fitTimer = setTimeout(() => this.scheduleFit(), wait);
-      return;
-    }
-    if (this.busy || this.closed) return;
-    if (this.draft) return; // re-checked when the draft is sent or cleared
-    const want = this.fitLines();
-    if (Math.abs(want - this.heightLines) >= 2) this.resize(want);
+    this.fitTimer = setTimeout(() => {
+      if (this.busy || this.closed || this.inputFocused) return;
+      const want = this.fitLines();
+      if (Math.abs(want - this.heightLines) >= 2) this.resize(want);
+    }, 300);
   }
 
   ask(text: string): Promise<void> {

@@ -20,8 +20,9 @@ html, body {
   line-height: 1.55;
 }
 
+/* Shrinks to its content; .fill makes it take the whole inset. */
 .pop {
-  height: 100%;
+  max-height: calc(100% - 4px);
   max-width: min(900px, calc(var(--pop-visible-width, 100vw) - 20px));
   margin: 2px 16px 2px 0;
   display: flex;
@@ -62,8 +63,11 @@ button:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
 #stop[hidden] { display: none; }
 .icon { font-size: 1.15em; line-height: 1; }
 
+.pop.fill { height: calc(100% - 4px); }
+
 main {
   flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
   padding: 0 14px;
 }
